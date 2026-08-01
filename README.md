@@ -1,10 +1,12 @@
 # Recurring Invoice Automation
 
-Automatically creates a draft Stripe invoice on a recurring schedule (for example, a fixed number of hours every two weeks). It
-watches a macOS Calendar event and, the moment it fires, generates the draft through the Stripe API on its own. No more doing
-mental math on when a client's billing period ends or how many hours to bill them for. Designed to run as a scheduled job (cron
-or macOS `launchd`), it just runs on schedule and drops a ready to review draft into Stripe, so invoicing stops being something
-you have to remember to do.
+Automatically creates a draft Stripe invoice on a recurring schedule (for example, a fixed number of hours every two weeks). 
+
+It watches a macOS Calendar event and, the moment it fires, generates the draft through the Stripe API on its own. No more doing
+mental math on when a client's billing period ends or how many hours to bill them for. 
+
+Designed to run as a scheduled job (cron or macOS `launchd`), it just runs on schedule and drops a ready to review draft into Stripe, 
+so invoicing stops being something you have to remember to do.
 
 This is a **template**. It ships with no client data, no contract terms, and no credentials.
 Every value specific to your engagement lives in your own `.env` file, which is gitignored and
