@@ -1,0 +1,14 @@
+{
+  "name": "recurring-invoice-automation",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "invoice": "node create-invoice.js",
+    "invoice:force": "node create-invoice.js --force"
+  },
+  "dependencies": {
+    "dotenv": "16.6.1",
+    "stripe": "17.7.0"
+  }
+}

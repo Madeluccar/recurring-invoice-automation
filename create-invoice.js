@@ -1,0 +1,226 @@
+import Stripe from "stripe";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { readFileSync } from "node:fs";
+import { parse as parseDotenv } from "dotenv";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
+
+const execFileAsync = promisify(execFile);
+const __dirname = dirname(fileURLToPath(import.meta.url));
+
+// Read .env into a local object instead of `dotenv/config`, which copies every key into the
+// global process.env for the whole Node process. Keeping secrets local means a compromised
+// dependency can't just grep process.env from anywhere to steal them - it would need to
+// specifically target this module. Real environment variables (e.g. set by launchd) still work
+// as a fallback for anything not present in .env.
+const dotenvFile = (() => {
+  try {
+    return parseDotenv(readFileSync(join(__dirname, ".env")));
+  } catch {
+    return {};
+  }
+})();
+
+function getEnv(name) {
+  return dotenvFile[name] ?? process.env[name];
+}
+
+function requireEnv(name) {
+  const value = getEnv(name);
+  if (!value) {
+    throw new Error(`Missing required environment variable: ${name}`);
+  }
+  return value;
+}
+
+function parseDate(value, name) {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+  if (!match) {
+    throw new Error(`${name} must be in YYYY-MM-DD format, got: ${value}`);
+  }
+  const [, year, month, day] = match;
+  return new Date(Number(year), Number(month) - 1, Number(day));
+}
+
+const CALENDAR_EVENT_NAME = getEnv("CALENDAR_EVENT_NAME") || "Create Invoice";
+
+const stripe = new Stripe(requireEnv("STRIPE_SECRET_KEY"));
+const CUSTOMER_ID = requireEnv("STRIPE_CUSTOMER_ID");
+const PRICE_ID = requireEnv("STRIPE_PRICE_ID");
+const TEMPLATE_ID = getEnv("STRIPE_TEMPLATE_ID");
+
+const CLIENT_NAME = requireEnv("CLIENT_NAME");
+const HOURS_PER_PERIOD = Number(requireEnv("HOURS_PER_PERIOD"));
+const PERIOD_DAYS = Number(getEnv("PERIOD_DAYS") || 14);
+const DUE_DAYS_AFTER_INVOICE = Number(getEnv("DUE_DAYS_AFTER_INVOICE") || 14);
+const INVOICE_DESCRIPTION =
+  getEnv("INVOICE_DESCRIPTION") || "Consulting services. Review and update memo before sending.";
+const INVOICE_ITEM_DESCRIPTION = getEnv("INVOICE_ITEM_DESCRIPTION") || "Consulting services";
+
+// First invoice date in the recurring series. Every subsequent period is exactly PERIOD_DAYS later.
+const ANCHOR_INVOICE_DATE = parseDate(requireEnv("ANCHOR_INVOICE_DATE"), "ANCHOR_INVOICE_DATE");
+
+function addDays(date, days) {
+  const result = new Date(date);
+  result.setDate(result.getDate() + days);
+  return result;
+}
+
+function daysBetween(a, b) {
+  const msPerDay = 24 * 60 * 60 * 1000;
+  return Math.round((startOfDay(b) - startOfDay(a)) / msPerDay);
+}
+
+function startOfDay(date) {
+  return new Date(date.getFullYear(), date.getMonth(), date.getDate());
+}
+
+function formatDate(date) {
+  return date.toISOString().slice(0, 10);
+}
+
+function noonUnix(date) {
+  return Math.floor(
+    new Date(date.getFullYear(), date.getMonth(), date.getDate(), 12).getTime() / 1000
+  );
+}
+
+// Snaps `today` to the invoice period it falls in, based on the anchor cadence.
+function currentPeriod(today) {
+  const offset = daysBetween(ANCHOR_INVOICE_DATE, today);
+  const periodsElapsed = Math.round(offset / PERIOD_DAYS);
+  const invoiceDate = addDays(ANCHOR_INVOICE_DATE, periodsElapsed * PERIOD_DAYS);
+  const serviceEnd = invoiceDate;
+  const serviceStart = addDays(invoiceDate, -11); // Monday, 11 days before the Friday invoice date
+  const dueDate = addDays(invoiceDate, DUE_DAYS_AFTER_INVOICE);
+  return { invoiceDate, serviceStart, serviceEnd, dueDate };
+}
+
+function isInvoiceFriday(today) {
+  const offset = daysBetween(ANCHOR_INVOICE_DATE, today);
+  return offset % PERIOD_DAYS === 0;
+}
+
+// AppleScript's "whose start date" filter only matches an event's first occurrence, not
+// future instances of a recurring event, so instead we read the event's own start date +
+// recurrence rule once and compute occurrences ourselves.
+async function findCalendarSeries() {
+  const script = `
+    tell application "Calendar"
+      repeat with c in calendars
+        set matches to (every event of c whose summary contains "${CALENDAR_EVENT_NAME}")
+        if (count of matches) > 0 then
+          set e to item 1 of matches
+          set d to start date of e
+          set mo to (month of d) as integer
+          return (year of d as string) & "-" & (mo as string) & "-" & (day of d as string) & "||" & (recurrence of e as string)
+        end if
+      end repeat
+      return ""
+    end tell
+  `;
+  const { stdout } = await execFileAsync("osascript", ["-e", script]);
+  const output = stdout.trim();
+  if (!output) return null;
+
+  const [datePart, recurrence] = output.split("||");
+  const [year, month, day] = datePart.split("-").map(Number);
+  const seriesStart = startOfDay(new Date(year, month - 1, day));
+
+  const intervalMatch = recurrence.match(/FREQ=WEEKLY;INTERVAL=(\d+)/);
+  const intervalWeeks = intervalMatch ? Number(intervalMatch[1]) : 1;
+
+  return { seriesStart, intervalWeeks };
+}
+
+// Returns true/false if the Calendar check succeeded, or null if it couldn't be performed
+// (e.g. Calendar access not yet granted to osascript, or no matching event exists at all).
+async function hasCalendarEventToday(today) {
+  try {
+    const series = await findCalendarSeries();
+    if (!series) {
+      console.warn(`No "${CALENDAR_EVENT_NAME}" event found in any calendar, falling back to date math.`);
+      return null;
+    }
+    const { seriesStart, intervalWeeks } = series;
+    if (today.getDay() !== seriesStart.getDay()) return false;
+    const weeksSinceStart = daysBetween(seriesStart, today) / 7;
+    return weeksSinceStart >= 0 && weeksSinceStart % intervalWeeks === 0;
+  } catch (error) {
+    console.warn(`Calendar check unavailable (${error.message.split("\n")[0]}), falling back to date math.`);
+    return null;
+  }
+}
+
+async function invoiceAlreadyExists(serviceStart, serviceEnd) {
+  const recent = await stripe.invoices.list({ customer: CUSTOMER_ID, limit: 10 });
+  return recent.data.some(
+    (inv) =>
+      inv.metadata?.service_start === formatDate(serviceStart) &&
+      inv.metadata?.service_end === formatDate(serviceEnd)
+  );
+}
+
+async function createConsultingInvoice({ invoiceDate, serviceStart, serviceEnd, dueDate }) {
+  if (await invoiceAlreadyExists(serviceStart, serviceEnd)) {
+    console.log(
+      `Draft already exists for ${formatDate(serviceStart)} - ${formatDate(serviceEnd)}, skipping.`
+    );
+    return;
+  }
+
+  const invoice = await stripe.invoices.create({
+    customer: CUSTOMER_ID,
+    collection_method: "send_invoice",
+    due_date: noonUnix(dueDate),
+    auto_advance: false,
+    ...(TEMPLATE_ID ? { rendering: { template: TEMPLATE_ID } } : {}),
+    description: INVOICE_DESCRIPTION,
+    metadata: {
+      client: CLIENT_NAME,
+      service_start: formatDate(serviceStart),
+      service_end: formatDate(serviceEnd),
+      intended_invoice_date: formatDate(invoiceDate),
+    },
+  });
+
+  await stripe.invoiceItems.create({
+    customer: CUSTOMER_ID,
+    invoice: invoice.id,
+    pricing: { price: PRICE_ID },
+    quantity: HOURS_PER_PERIOD,
+    description: INVOICE_ITEM_DESCRIPTION,
+    period: {
+      start: noonUnix(serviceStart),
+      end: noonUnix(serviceEnd),
+    },
+  });
+
+  console.log(
+    `Draft invoice created: ${invoice.id} | ${formatDate(serviceStart)} - ${formatDate(serviceEnd)} | due ${formatDate(dueDate)}`
+  );
+}
+
+async function main() {
+  const force = process.argv.includes("--force");
+  const today = startOfDay(new Date());
+
+  if (!force) {
+    const calendarMatch = await hasCalendarEventToday(today);
+    const shouldRun = calendarMatch === null ? isInvoiceFriday(today) : calendarMatch;
+
+    if (!shouldRun) {
+      const reason = calendarMatch === null ? "not an invoice Friday (date math)" : `no "${CALENDAR_EVENT_NAME}" event today`;
+      console.log(`${formatDate(today)}: ${reason}, skipping. Use --force to override.`);
+      return;
+    }
+  }
+
+  await createConsultingInvoice(currentPeriod(today));
+}
+
+main().catch((error) => {
+  console.error("Could not create invoice:", error.message);
+  process.exit(1);
+});
