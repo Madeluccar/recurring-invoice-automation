@@ -14,17 +14,29 @@ never committed.
 
 ## How it decides when to invoice
 
-On each run, the script checks, in order:
+Meant to run daily. On each run, it checks, in order:
 
 1. Whether a recurring macOS Calendar event named `CALENDAR_EVENT_NAME` occurs today.
 2. If Calendar access isn't available or no matching event exists, it falls back to pure date
    math from `ANCHOR_INVOICE_DATE` and `PERIOD_DAYS`.
 
-If neither condition is met, it exits without creating anything. Pass `--force` to skip this
-check and create the invoice for the current period regardless.
+If either check says today's the day, it creates the invoice for the current period. Pass
+`--force` to skip both checks and create the invoice for the current period regardless.
 
-It also checks Stripe for an existing draft covering the same service period before creating a
-new one, so re-running it (for example, after a failed run) won't create duplicates.
+If neither check says today's the day, it doesn't just exit. It looks at the most recently
+elapsed period (the last one that should already have been invoiced) and, if there's no Stripe
+draft for it yet, creates one and sends a macOS notification. This covers the case where the
+scheduled run never happened at all, for example the Mac was asleep on the actual invoice day, so
+the next time it runs, it catches up instead of silently falling behind.
+
+Before creating anything, on any of these paths, it also checks Stripe for an existing draft
+covering the same service period, so re-running it (for example, after a failed run) won't create
+duplicates. Invoice and invoice item creation also carry a Stripe idempotency key, so even a
+retried request can't create a second draft.
+
+You'll get a macOS notification whenever a draft is actually created, or whenever creation fails,
+regardless of which of the three paths above triggered it (scheduled, forced, or catch-up). No
+notification if a run finds nothing to do.
 
 ## Setup
 
@@ -43,8 +55,12 @@ new one, so re-running it (for example, after a failed run) won't create duplica
      `Invoice Items: Write`, not your full account secret key.
    - `STRIPE_CUSTOMER_ID`, `STRIPE_PRICE_ID`: from your Stripe dashboard.
    - `CLIENT_NAME`, `HOURS_PER_PERIOD`, `PERIOD_DAYS`, `DUE_DAYS_AFTER_INVOICE`,
-     `ANCHOR_INVOICE_DATE`, `INVOICE_DESCRIPTION`, `INVOICE_ITEM_DESCRIPTION`: match these to
-     your actual contract terms.
+     `SERVICE_DAYS_BEFORE_INVOICE`, `ANCHOR_INVOICE_DATE`, `INVOICE_DESCRIPTION`,
+     `INVOICE_ITEM_DESCRIPTION`: match these to your actual contract terms.
+     `SERVICE_DAYS_BEFORE_INVOICE` defaults to `PERIOD_DAYS - 3` if left unset, which assumes a
+     Friday invoice date with a Monday start. That only holds for 7- or 14-day Friday cadences;
+     if your invoice day or weekend policy is different, set it explicitly instead of relying on
+     the default.
 4. Run it manually to test:
    ```
    npm run invoice
@@ -56,8 +72,9 @@ new one, so re-running it (for example, after a failed run) won't create duplica
 
 ## Scheduling
 
-Run it on whatever cadence covers your invoice days (daily is simplest). The script itself
-decides whether to actually create an invoice that day.
+Run it daily. The script itself decides whether today's an invoice day, and the catch-up behavior
+described above only has a chance to run if it's actually being invoked regularly, not just on
+the days you expect an invoice.
 
 **cron** (daily at 9am):
 ```
