@@ -55,6 +55,10 @@ notification if a run finds nothing to do.
    - `CLIENT_NAME`, `HOURS_PER_PERIOD`, `PERIOD_DAYS`, `DUE_DAYS_AFTER_INVOICE`,
      `SERVICE_DAYS_BEFORE_INVOICE`, `ANCHOR_INVOICE_DATE`, `INVOICE_DESCRIPTION`,
      `INVOICE_ITEM_DESCRIPTION`: match these to your actual contract terms.
+     `SERVICE_DAYS_BEFORE_INVOICE` defaults to `PERIOD_DAYS - 3` if left unset, which assumes a
+     Friday invoice date with a Monday start. That only holds for 7- or 14-day Friday cadences;
+     if your invoice day or weekend policy is different, set it explicitly instead of relying on
+     the default.
 4. Run it manually to test:
    ```
    npm run invoice

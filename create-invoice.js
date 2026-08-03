@@ -43,6 +43,30 @@ function parseDate(value, name) {
   return new Date(Number(year), Number(month) - 1, Number(day));
 }
 
+function parseNonNegativeInt(value, name) {
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    throw new Error(`${name} must be a non-negative whole number, got: ${value}`);
+  }
+  return parsed;
+}
+
+function parsePositiveInt(value, name) {
+  const parsed = parseNonNegativeInt(value, name);
+  if (parsed === 0) {
+    throw new Error(`${name} must be greater than 0, got: ${value}`);
+  }
+  return parsed;
+}
+
+function parsePositiveNumber(value, name) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    throw new Error(`${name} must be a positive number, got: ${value}`);
+  }
+  return parsed;
+}
+
 const CALENDAR_EVENT_NAME = getEnv("CALENDAR_EVENT_NAME") || "Create Invoice";
 
 const stripe = new Stripe(requireEnv("STRIPE_SECRET_KEY"));
@@ -51,10 +75,16 @@ const PRICE_ID = requireEnv("STRIPE_PRICE_ID");
 const TEMPLATE_ID = getEnv("STRIPE_TEMPLATE_ID");
 
 const CLIENT_NAME = requireEnv("CLIENT_NAME");
-const HOURS_PER_PERIOD = Number(requireEnv("HOURS_PER_PERIOD"));
-const PERIOD_DAYS = Number(getEnv("PERIOD_DAYS") || 14);
-const DUE_DAYS_AFTER_INVOICE = Number(getEnv("DUE_DAYS_AFTER_INVOICE") || 14);
-const SERVICE_DAYS_BEFORE_INVOICE = Number(getEnv("SERVICE_DAYS_BEFORE_INVOICE") || PERIOD_DAYS - 3);
+const HOURS_PER_PERIOD = parsePositiveNumber(requireEnv("HOURS_PER_PERIOD"), "HOURS_PER_PERIOD");
+const PERIOD_DAYS = parsePositiveInt(getEnv("PERIOD_DAYS") || 14, "PERIOD_DAYS");
+const DUE_DAYS_AFTER_INVOICE = parseNonNegativeInt(
+  getEnv("DUE_DAYS_AFTER_INVOICE") || 14,
+  "DUE_DAYS_AFTER_INVOICE"
+);
+const SERVICE_DAYS_BEFORE_INVOICE = parseNonNegativeInt(
+  getEnv("SERVICE_DAYS_BEFORE_INVOICE") || PERIOD_DAYS - 3,
+  "SERVICE_DAYS_BEFORE_INVOICE"
+);
 const INVOICE_DESCRIPTION =
   getEnv("INVOICE_DESCRIPTION") || "Consulting services. Review and update memo before sending.";
 const INVOICE_ITEM_DESCRIPTION = getEnv("INVOICE_ITEM_DESCRIPTION") || "Consulting services";
@@ -231,24 +261,29 @@ async function createConsultingInvoice({ invoiceDate, serviceStart, serviceEnd, 
   return invoice;
 }
 
-// Creates the invoice for `period` and sends a macOS notification reflecting the outcome:
-// created, or failed. Stays silent (no notification) when a draft already existed, since that's
-// a routine no-op, not something worth interrupting you about. Rethrows on failure so the caller
-// still logs the error and the process exits non-zero, same as before.
+// Creates the invoice for `period` under a given `context` ("scheduled run", "forced run", or
+// "catch-up run") and notifies based on the outcome:
+//   - created:          notify success
+//   - null (skipped):   log only, no notification - a routine no-op isn't worth interrupting you
+//   - throws:           notify failure, then rethrow so the caller still logs the error and the
+//                        process exits non-zero, same as before
+// `context` goes in the notification title, not just the body, so catch-up's "you missed it"
+// signal stays visible even at a glance, rather than being buried inside the message text.
 async function runAndNotify(period, context) {
+  const title = `Invoice: ${context}`;
   try {
     const invoice = await createConsultingInvoice(period);
     if (invoice) {
       await notify(
-        `Draft created for ${formatDate(period.serviceStart)} to ${formatDate(period.serviceEnd)} (${context}).`,
-        "Invoice draft created"
+        `Draft created for ${formatDate(period.serviceStart)} to ${formatDate(period.serviceEnd)}.`,
+        title
       );
     }
     return invoice;
   } catch (error) {
     await notify(
-      `Could not create invoice for ${formatDate(period.serviceStart)} to ${formatDate(period.serviceEnd)} (${context}): ${error.message}`,
-      "Invoice creation failed"
+      `Could not create invoice for ${formatDate(period.serviceStart)} to ${formatDate(period.serviceEnd)}: ${error.message}`,
+      title
     );
     throw error;
   }
