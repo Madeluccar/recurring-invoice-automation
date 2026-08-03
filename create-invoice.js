@@ -77,7 +77,10 @@ function startOfDay(date) {
 }
 
 function formatDate(date) {
-  return date.toISOString().slice(0, 10);
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
 }
 
 function noonUnix(date) {
@@ -86,15 +89,25 @@ function noonUnix(date) {
   );
 }
 
-// Snaps `today` to the invoice period it falls in, based on the anchor cadence.
-function currentPeriod(today) {
-  const offset = daysBetween(ANCHOR_INVOICE_DATE, today);
-  const periodsElapsed = Math.round(offset / PERIOD_DAYS);
+function periodFromPeriodsElapsed(periodsElapsed) {
   const invoiceDate = addDays(ANCHOR_INVOICE_DATE, periodsElapsed * PERIOD_DAYS);
   const serviceEnd = invoiceDate;
   const serviceStart = addDays(invoiceDate, -11); // Monday, 11 days before the Friday invoice date
   const dueDate = addDays(invoiceDate, DUE_DAYS_AFTER_INVOICE);
   return { invoiceDate, serviceStart, serviceEnd, dueDate };
+}
+
+// Snaps `today` to the invoice period it falls in, based on the anchor cadence.
+function currentPeriod(today) {
+  const offset = daysBetween(ANCHOR_INVOICE_DATE, today);
+  return periodFromPeriodsElapsed(Math.round(offset / PERIOD_DAYS));
+}
+
+// Number of full periods that have elapsed as of `today`, always rounding down so the result
+// never points at a period that hasn't happened yet. Negative before ANCHOR_INVOICE_DATE.
+function periodsElapsedAsOf(today) {
+  const offset = daysBetween(ANCHOR_INVOICE_DATE, today);
+  return Math.floor(offset / PERIOD_DAYS);
 }
 
 function isInvoiceFriday(today) {
@@ -153,6 +166,17 @@ async function hasCalendarEventToday(today) {
   }
 }
 
+async function notify(message, title = "Recurring Invoice Automation") {
+  try {
+    await execFileAsync("osascript", [
+      "-e",
+      `display notification ${JSON.stringify(message)} with title ${JSON.stringify(title)}`,
+    ]);
+  } catch (error) {
+    console.warn(`Could not send notification (${error.message.split("\n")[0]}).`);
+  }
+}
+
 async function invoiceAlreadyExists(serviceStart, serviceEnd) {
   const recent = await stripe.invoices.list({ customer: CUSTOMER_ID, limit: 10 });
   return recent.data.some(
@@ -170,54 +194,92 @@ async function createConsultingInvoice({ invoiceDate, serviceStart, serviceEnd, 
     return;
   }
 
-  const invoice = await stripe.invoices.create({
-    customer: CUSTOMER_ID,
-    collection_method: "send_invoice",
-    due_date: noonUnix(dueDate),
-    auto_advance: false,
-    ...(TEMPLATE_ID ? { rendering: { template: TEMPLATE_ID } } : {}),
-    description: INVOICE_DESCRIPTION,
-    metadata: {
-      client: CLIENT_NAME,
-      service_start: formatDate(serviceStart),
-      service_end: formatDate(serviceEnd),
-      intended_invoice_date: formatDate(invoiceDate),
+  const invoice = await stripe.invoices.create(
+    {
+      customer: CUSTOMER_ID,
+      collection_method: "send_invoice",
+      due_date: noonUnix(dueDate),
+      auto_advance: false,
+      ...(TEMPLATE_ID ? { rendering: { template: TEMPLATE_ID } } : {}),
+      description: INVOICE_DESCRIPTION,
+      metadata: {
+        client: CLIENT_NAME,
+        service_start: formatDate(serviceStart),
+        service_end: formatDate(serviceEnd),
+        intended_invoice_date: formatDate(invoiceDate),
+      },
     },
-  });
+    { idempotencyKey: `invoice_${CUSTOMER_ID}_${formatDate(serviceStart)}_${formatDate(serviceEnd)}` }
+  );
 
-  await stripe.invoiceItems.create({
-    customer: CUSTOMER_ID,
-    invoice: invoice.id,
-    pricing: { price: PRICE_ID },
-    quantity: HOURS_PER_PERIOD,
-    description: INVOICE_ITEM_DESCRIPTION,
-    period: {
-      start: noonUnix(serviceStart),
-      end: noonUnix(serviceEnd),
+  await stripe.invoiceItems.create(
+    {
+      customer: CUSTOMER_ID,
+      invoice: invoice.id,
+      pricing: { price: PRICE_ID },
+      quantity: HOURS_PER_PERIOD,
+      description: INVOICE_ITEM_DESCRIPTION,
+      period: {
+        start: noonUnix(serviceStart),
+        end: noonUnix(serviceEnd),
+      },
     },
-  });
+    { idempotencyKey: `invoiceitem_${invoice.id}` }
+  );
 
   console.log(
     `Draft invoice created: ${invoice.id} | ${formatDate(serviceStart)} - ${formatDate(serviceEnd)} | due ${formatDate(dueDate)}`
   );
 }
 
+async function catchUpMissedInvoice(today) {
+  const periodsElapsed = periodsElapsedAsOf(today);
+  if (periodsElapsed < 0) return; // before ANCHOR_INVOICE_DATE, nothing to catch up on yet
+
+  const period = periodFromPeriodsElapsed(periodsElapsed);
+  if (await invoiceAlreadyExists(period.serviceStart, period.serviceEnd)) {
+    console.log(
+      `${formatDate(today)}: not an invoice day, and ${formatDate(period.serviceStart)} to ${formatDate(period.serviceEnd)} is already invoiced. Skipping.`
+    );
+    return;
+  }
+
+  console.warn(
+    `Missed invoice day for ${formatDate(period.serviceStart)} to ${formatDate(period.serviceEnd)} (due ${formatDate(period.invoiceDate)}). Creating catch-up draft.`
+  );
+  try {
+    await createConsultingInvoice(period);
+    await notify(
+      `Catch-up draft created for ${formatDate(period.serviceStart)} to ${formatDate(period.serviceEnd)}.`,
+      "Invoice due: draft created"
+    );
+  } catch (error) {
+    await notify(
+      `Could not create catch-up draft for ${formatDate(period.serviceStart)} to ${formatDate(period.serviceEnd)}: ${error.message}`,
+      "Invoice due: draft missing"
+    );
+    throw error;
+  }
+}
+
 async function main() {
   const force = process.argv.includes("--force");
   const today = startOfDay(new Date());
 
-  if (!force) {
-    const calendarMatch = await hasCalendarEventToday(today);
-    const shouldRun = calendarMatch === null ? isInvoiceFriday(today) : calendarMatch;
-
-    if (!shouldRun) {
-      const reason = calendarMatch === null ? "not an invoice Friday (date math)" : `no "${CALENDAR_EVENT_NAME}" event today`;
-      console.log(`${formatDate(today)}: ${reason}, skipping. Use --force to override.`);
-      return;
-    }
+  if (force) {
+    await createConsultingInvoice(currentPeriod(today));
+    return;
   }
 
-  await createConsultingInvoice(currentPeriod(today));
+  const calendarMatch = await hasCalendarEventToday(today);
+  const shouldRunToday = calendarMatch === null ? isInvoiceFriday(today) : calendarMatch;
+
+  if (shouldRunToday) {
+    await createConsultingInvoice(currentPeriod(today));
+    return;
+  }
+
+  await catchUpMissedInvoice(today);
 }
 
 main().catch((error) => {
