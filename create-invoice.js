@@ -54,6 +54,7 @@ const CLIENT_NAME = requireEnv("CLIENT_NAME");
 const HOURS_PER_PERIOD = Number(requireEnv("HOURS_PER_PERIOD"));
 const PERIOD_DAYS = Number(getEnv("PERIOD_DAYS") || 14);
 const DUE_DAYS_AFTER_INVOICE = Number(getEnv("DUE_DAYS_AFTER_INVOICE") || 14);
+const SERVICE_DAYS_BEFORE_INVOICE = Number(getEnv("SERVICE_DAYS_BEFORE_INVOICE") || PERIOD_DAYS - 3);
 const INVOICE_DESCRIPTION =
   getEnv("INVOICE_DESCRIPTION") || "Consulting services. Review and update memo before sending.";
 const INVOICE_ITEM_DESCRIPTION = getEnv("INVOICE_ITEM_DESCRIPTION") || "Consulting services";
@@ -92,19 +93,16 @@ function noonUnix(date) {
 function periodFromPeriodsElapsed(periodsElapsed) {
   const invoiceDate = addDays(ANCHOR_INVOICE_DATE, periodsElapsed * PERIOD_DAYS);
   const serviceEnd = invoiceDate;
-  const serviceStart = addDays(invoiceDate, -11); // Monday, 11 days before the Friday invoice date
+  const serviceStart = addDays(invoiceDate, -SERVICE_DAYS_BEFORE_INVOICE);
   const dueDate = addDays(invoiceDate, DUE_DAYS_AFTER_INVOICE);
   return { invoiceDate, serviceStart, serviceEnd, dueDate };
 }
 
-// Snaps `today` to the invoice period it falls in, based on the anchor cadence.
-function currentPeriod(today) {
-  const offset = daysBetween(ANCHOR_INVOICE_DATE, today);
-  return periodFromPeriodsElapsed(Math.round(offset / PERIOD_DAYS));
-}
-
 // Number of full periods that have elapsed as of `today`, always rounding down so the result
-// never points at a period that hasn't happened yet. Negative before ANCHOR_INVOICE_DATE.
+// never points at a period that hasn't happened yet. Negative before ANCHOR_INVOICE_DATE. Used
+// for every period lookup (on-time, --force, catch-up) so there's a single source of truth for
+// "which period are we talking about", instead of a separate rounding-based variant that could
+// snap forward to a not-yet-due period when run off-cycle.
 function periodsElapsedAsOf(today) {
   const offset = daysBetween(ANCHOR_INVOICE_DATE, today);
   return Math.floor(offset / PERIOD_DAYS);
@@ -178,7 +176,7 @@ async function notify(message, title = "Recurring Invoice Automation") {
 }
 
 async function invoiceAlreadyExists(serviceStart, serviceEnd) {
-  const recent = await stripe.invoices.list({ customer: CUSTOMER_ID, limit: 10 });
+  const recent = await stripe.invoices.list({ customer: CUSTOMER_ID, limit: 100 });
   return recent.data.some(
     (inv) =>
       inv.metadata?.service_start === formatDate(serviceStart) &&
@@ -191,7 +189,7 @@ async function createConsultingInvoice({ invoiceDate, serviceStart, serviceEnd, 
     console.log(
       `Draft already exists for ${formatDate(serviceStart)} - ${formatDate(serviceEnd)}, skipping.`
     );
-    return;
+    return null;
   }
 
   const invoice = await stripe.invoices.create(
@@ -230,6 +228,30 @@ async function createConsultingInvoice({ invoiceDate, serviceStart, serviceEnd, 
   console.log(
     `Draft invoice created: ${invoice.id} | ${formatDate(serviceStart)} - ${formatDate(serviceEnd)} | due ${formatDate(dueDate)}`
   );
+  return invoice;
+}
+
+// Creates the invoice for `period` and sends a macOS notification reflecting the outcome:
+// created, or failed. Stays silent (no notification) when a draft already existed, since that's
+// a routine no-op, not something worth interrupting you about. Rethrows on failure so the caller
+// still logs the error and the process exits non-zero, same as before.
+async function runAndNotify(period, context) {
+  try {
+    const invoice = await createConsultingInvoice(period);
+    if (invoice) {
+      await notify(
+        `Draft created for ${formatDate(period.serviceStart)} to ${formatDate(period.serviceEnd)} (${context}).`,
+        "Invoice draft created"
+      );
+    }
+    return invoice;
+  } catch (error) {
+    await notify(
+      `Could not create invoice for ${formatDate(period.serviceStart)} to ${formatDate(period.serviceEnd)} (${context}): ${error.message}`,
+      "Invoice creation failed"
+    );
+    throw error;
+  }
 }
 
 async function catchUpMissedInvoice(today) {
@@ -247,27 +269,16 @@ async function catchUpMissedInvoice(today) {
   console.warn(
     `Missed invoice day for ${formatDate(period.serviceStart)} to ${formatDate(period.serviceEnd)} (due ${formatDate(period.invoiceDate)}). Creating catch-up draft.`
   );
-  try {
-    await createConsultingInvoice(period);
-    await notify(
-      `Catch-up draft created for ${formatDate(period.serviceStart)} to ${formatDate(period.serviceEnd)}.`,
-      "Invoice due: draft created"
-    );
-  } catch (error) {
-    await notify(
-      `Could not create catch-up draft for ${formatDate(period.serviceStart)} to ${formatDate(period.serviceEnd)}: ${error.message}`,
-      "Invoice due: draft missing"
-    );
-    throw error;
-  }
+  await runAndNotify(period, "catch-up run");
 }
 
 async function main() {
   const force = process.argv.includes("--force");
   const today = startOfDay(new Date());
+  const period = periodFromPeriodsElapsed(periodsElapsedAsOf(today));
 
   if (force) {
-    await createConsultingInvoice(currentPeriod(today));
+    await runAndNotify(period, "forced run");
     return;
   }
 
@@ -275,7 +286,7 @@ async function main() {
   const shouldRunToday = calendarMatch === null ? isInvoiceFriday(today) : calendarMatch;
 
   if (shouldRunToday) {
-    await createConsultingInvoice(currentPeriod(today));
+    await runAndNotify(period, "scheduled run");
     return;
   }
 
