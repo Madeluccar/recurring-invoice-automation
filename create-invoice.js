@@ -365,6 +365,15 @@ async function main() {
   const shouldRunToday = calendarMatch === null ? isInvoiceFriday(today) : calendarMatch;
 
   if (shouldRunToday) {
+    // `period` is derived from ANCHOR_INVOICE_DATE/PERIOD_DAYS math, which is only guaranteed to
+    // land on today when the Calendar event's actual recurrence still matches that math. If the
+    // Calendar says yes but today isn't an anchor/period boundary, the two have drifted apart and
+    // the service dates below may be for a stale period rather than today's.
+    if (calendarMatch === true && !isInvoiceFriday(today)) {
+      console.warn(
+        `Calendar says today (${formatDate(today)}) is an invoice day, but it doesn't land on an ANCHOR_INVOICE_DATE/PERIOD_DAYS boundary. The computed service period (${formatDate(period.serviceStart)} - ${formatDate(period.serviceEnd)}) may be stale - check that ANCHOR_INVOICE_DATE and PERIOD_DAYS still match the Calendar event's actual recurrence.`
+      );
+    }
     await runAndNotify(period, "scheduled run");
     return;
   }
