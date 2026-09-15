@@ -318,8 +318,12 @@ async function runAndNotify(period, context) {
     }
     return invoice;
   } catch (error) {
+    // Trimmed to its first line, same as every other place this codebase surfaces error.message:
+    // a raw multi-line Stripe error passed whole into the AppleScript source below isn't escaped
+    // the way AppleScript string literals expect, and can produce a notification that's garbled
+    // or fails outright - the one alert this failure path exists to guarantee.
     await notify(
-      `Could not create invoice for ${formatDate(period.serviceStart)} to ${formatDate(period.serviceEnd)}: ${error.message}`,
+      `Could not create invoice for ${formatDate(period.serviceStart)} to ${formatDate(period.serviceEnd)}: ${error.message.split("\n")[0]}`,
       title
     );
     throw error;
