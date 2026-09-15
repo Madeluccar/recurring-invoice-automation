@@ -229,9 +229,12 @@ async function findExistingInvoice(serviceStart, serviceEnd) {
   return recent.data.find((inv) => matchesServiceDates(inv, serviceStart, serviceEnd)) ?? null;
 }
 
-async function invoiceAlreadyExists(serviceStart, serviceEnd) {
-  return (await findExistingInvoice(serviceStart, serviceEnd)) !== null;
-}
+// No longer called directly - both call sites now need the invoice object itself (to check for
+// missing line items / share one lookup between catch-up's check and createConsultingInvoice),
+// so they use findExistingInvoice() instead.
+// async function invoiceAlreadyExists(serviceStart, serviceEnd) {
+//   return (await findExistingInvoice(serviceStart, serviceEnd)) !== null;
+// }
 
 async function addInvoiceItem(invoiceId, serviceStart, serviceEnd) {
   await stripe.invoiceItems.create(
@@ -250,8 +253,12 @@ async function addInvoiceItem(invoiceId, serviceStart, serviceEnd) {
   );
 }
 
-async function createConsultingInvoice({ invoiceDate, serviceStart, serviceEnd, dueDate }) {
-  const existing = await findExistingInvoice(serviceStart, serviceEnd);
+// `knownExisting` lets a caller that has already looked up the existing invoice for this period
+// (e.g. catchUpMissedInvoice, which has to check anyway before deciding whether to log a
+// "missed" warning) pass it in, instead of this function repeating the same Stripe list call.
+// Leave it undefined to have this function do its own lookup.
+async function createConsultingInvoice({ invoiceDate, serviceStart, serviceEnd, dueDate }, knownExisting) {
+  const existing = knownExisting !== undefined ? knownExisting : await findExistingInvoice(serviceStart, serviceEnd);
   if (existing) {
     // A prior run can have created the invoice but failed before adding its line item (e.g. a
     // network blip between the two Stripe calls). Rather than treating that empty draft as done
@@ -306,10 +313,10 @@ async function createConsultingInvoice({ invoiceDate, serviceStart, serviceEnd, 
 //                        process exits non-zero, same as before
 // `context` goes in the notification title, not just the body, so catch-up's "you missed it"
 // signal stays visible even at a glance, rather than being buried inside the message text.
-async function runAndNotify(period, context) {
+async function runAndNotify(period, context, knownExisting) {
   const title = `Invoice: ${context}`;
   try {
-    const invoice = await createConsultingInvoice(period);
+    const invoice = await createConsultingInvoice(period, knownExisting);
     if (invoice) {
       await notify(
         `Draft created for ${formatDate(period.serviceStart)} to ${formatDate(period.serviceEnd)}.`,
@@ -342,7 +349,11 @@ async function catchUpMissedInvoice(today) {
   // independently-computed anchor date that may have drifted from the Calendar's real cadence.
   if (period.invoiceDate.getTime() === today.getTime()) return;
 
-  if (await invoiceAlreadyExists(period.serviceStart, period.serviceEnd)) {
+  // Fetched once here and handed to runAndNotify -> createConsultingInvoice below, instead of
+  // each looking the invoice up separately - both need to know whether one already exists (and,
+  // if so, whether it still needs its line item) for this exact period.
+  const existing = await findExistingInvoice(period.serviceStart, period.serviceEnd);
+  if (existing && existing.lines.data.length > 0) {
     console.log(
       `${formatDate(today)}: not an invoice day, and ${formatDate(period.serviceStart)} to ${formatDate(period.serviceEnd)} is already invoiced. Skipping.`
     );
@@ -352,7 +363,7 @@ async function catchUpMissedInvoice(today) {
   console.warn(
     `Missed invoice day for ${formatDate(period.serviceStart)} to ${formatDate(period.serviceEnd)} (due ${formatDate(period.invoiceDate)}). Creating catch-up draft.`
   );
-  await runAndNotify(period, "catch-up run");
+  await runAndNotify(period, "catch-up run", existing);
 }
 
 async function main() {
