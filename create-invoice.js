@@ -205,21 +205,58 @@ async function notify(message, title = "Recurring Invoice Automation") {
   }
 }
 
-async function invoiceAlreadyExists(serviceStart, serviceEnd) {
+async function findExistingInvoice(serviceStart, serviceEnd) {
   const recent = await stripe.invoices.list({ customer: CUSTOMER_ID, limit: 100 });
-  return recent.data.some(
-    (inv) =>
-      inv.metadata?.service_start === formatDate(serviceStart) &&
-      inv.metadata?.service_end === formatDate(serviceEnd)
+  return (
+    recent.data.find(
+      (inv) =>
+        inv.metadata?.service_start === formatDate(serviceStart) &&
+        inv.metadata?.service_end === formatDate(serviceEnd)
+    ) ?? null
+  );
+}
+
+async function invoiceAlreadyExists(serviceStart, serviceEnd) {
+  return (await findExistingInvoice(serviceStart, serviceEnd)) !== null;
+}
+
+async function addInvoiceItem(invoiceId, serviceStart, serviceEnd) {
+  await stripe.invoiceItems.create(
+    {
+      customer: CUSTOMER_ID,
+      invoice: invoiceId,
+      pricing: { price: PRICE_ID },
+      quantity: HOURS_PER_PERIOD,
+      description: INVOICE_ITEM_DESCRIPTION,
+      period: {
+        start: noonUnix(serviceStart),
+        end: noonUnix(serviceEnd),
+      },
+    },
+    { idempotencyKey: `invoiceitem_${invoiceId}` }
   );
 }
 
 async function createConsultingInvoice({ invoiceDate, serviceStart, serviceEnd, dueDate }) {
-  if (await invoiceAlreadyExists(serviceStart, serviceEnd)) {
-    console.log(
-      `Draft already exists for ${formatDate(serviceStart)} - ${formatDate(serviceEnd)}, skipping.`
+  const existing = await findExistingInvoice(serviceStart, serviceEnd);
+  if (existing) {
+    // A prior run can have created the invoice but failed before adding its line item (e.g. a
+    // network blip between the two Stripe calls). Rather than treating that empty draft as done
+    // forever, finish it instead of silently skipping.
+    if (existing.lines.data.length > 0) {
+      console.log(
+        `Draft already exists for ${formatDate(serviceStart)} - ${formatDate(serviceEnd)}, skipping.`
+      );
+      return null;
+    }
+    console.warn(
+      `Found invoice ${existing.id} for ${formatDate(serviceStart)} - ${formatDate(serviceEnd)} with no line items, completing it.`
     );
-    return null;
+    await addInvoiceItem(existing.id, serviceStart, serviceEnd);
+    console.log(
+      `Completed invoice: ${existing.id} | ${formatDate(serviceStart)} - ${formatDate(serviceEnd)} | due ${formatDate(dueDate)}`
+    );
+    return existing;
   }
 
   const invoice = await stripe.invoices.create(
@@ -240,20 +277,7 @@ async function createConsultingInvoice({ invoiceDate, serviceStart, serviceEnd, 
     { idempotencyKey: `invoice_${CUSTOMER_ID}_${formatDate(serviceStart)}_${formatDate(serviceEnd)}` }
   );
 
-  await stripe.invoiceItems.create(
-    {
-      customer: CUSTOMER_ID,
-      invoice: invoice.id,
-      pricing: { price: PRICE_ID },
-      quantity: HOURS_PER_PERIOD,
-      description: INVOICE_ITEM_DESCRIPTION,
-      period: {
-        start: noonUnix(serviceStart),
-        end: noonUnix(serviceEnd),
-      },
-    },
-    { idempotencyKey: `invoiceitem_${invoice.id}` }
-  );
+  await addInvoiceItem(invoice.id, serviceStart, serviceEnd);
 
   console.log(
     `Draft invoice created: ${invoice.id} | ${formatDate(serviceStart)} - ${formatDate(serviceEnd)} | due ${formatDate(dueDate)}`
