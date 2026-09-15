@@ -44,8 +44,9 @@ function parseDate(value, name) {
 }
 
 function parseNonNegativeInt(value, name) {
-  const parsed = Number(value);
-  if (!Number.isInteger(parsed) || parsed < 0) {
+  const trimmed = String(value).trim();
+  const parsed = Number(trimmed);
+  if (trimmed === "" || !Number.isInteger(parsed) || parsed < 0) {
     throw new Error(`${name} must be a non-negative whole number, got: ${value}`);
   }
   return parsed;
