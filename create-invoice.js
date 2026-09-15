@@ -114,6 +114,14 @@ function formatDate(date) {
   return `${year}-${month}-${day}`;
 }
 
+// formatDate used to be `date.toISOString().slice(0, 10)` (UTC-based), which drifted from the
+// intended local calendar date near midnight. Invoices created before that fix still carry
+// UTC-formatted dates in their metadata, so matching has to accept either form - otherwise the
+// first run after the fix can't find them and creates a duplicate for an already-invoiced period.
+function formatDateLegacyUTC(date) {
+  return date.toISOString().slice(0, 10);
+}
+
 function noonUnix(date) {
   return Math.floor(
     new Date(date.getFullYear(), date.getMonth(), date.getDate(), 12).getTime() / 1000
@@ -205,15 +213,19 @@ async function notify(message, title = "Recurring Invoice Automation") {
   }
 }
 
+function matchesServiceDates(invoice, serviceStart, serviceEnd) {
+  const startMatches =
+    invoice.metadata?.service_start === formatDate(serviceStart) ||
+    invoice.metadata?.service_start === formatDateLegacyUTC(serviceStart);
+  const endMatches =
+    invoice.metadata?.service_end === formatDate(serviceEnd) ||
+    invoice.metadata?.service_end === formatDateLegacyUTC(serviceEnd);
+  return startMatches && endMatches;
+}
+
 async function findExistingInvoice(serviceStart, serviceEnd) {
   const recent = await stripe.invoices.list({ customer: CUSTOMER_ID, limit: 100 });
-  return (
-    recent.data.find(
-      (inv) =>
-        inv.metadata?.service_start === formatDate(serviceStart) &&
-        inv.metadata?.service_end === formatDate(serviceEnd)
-    ) ?? null
-  );
+  return recent.data.find((inv) => matchesServiceDates(inv, serviceStart, serviceEnd)) ?? null;
 }
 
 async function invoiceAlreadyExists(serviceStart, serviceEnd) {
