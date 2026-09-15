@@ -1,3 +1,4 @@
 node_modules/
 .env
 logs/
+.catch-up-state.json

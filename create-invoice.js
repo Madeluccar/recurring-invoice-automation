@@ -1,7 +1,7 @@
 import Stripe from "stripe";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { parse as parseDotenv } from "dotenv";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
@@ -121,6 +121,28 @@ function formatDate(date) {
 // first run after the fix can't find them and creates a duplicate for an already-invoiced period.
 function formatDateLegacyUTC(date) {
   return date.toISOString().slice(0, 10);
+}
+
+// Caches the last period catchUpMissedInvoice confirmed was already fully invoiced, so a daily
+// run doesn't have to ask Stripe again on every idle day between invoice dates - only once per
+// period, until that period's own confirmation is cached. Best-effort: if it can't be read or
+// written, catch-up just falls back to asking Stripe every time, same as before this existed.
+const CATCH_UP_STATE_FILE = join(__dirname, ".catch-up-state.json");
+
+function readConfirmedPeriodKey() {
+  try {
+    return JSON.parse(readFileSync(CATCH_UP_STATE_FILE, "utf8")).confirmedPeriodKey ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function writeConfirmedPeriodKey(periodKey) {
+  try {
+    writeFileSync(CATCH_UP_STATE_FILE, JSON.stringify({ confirmedPeriodKey: periodKey }));
+  } catch (error) {
+    console.warn(`Could not persist catch-up state (${error.message.split("\n")[0]}).`);
+  }
 }
 
 function noonUnix(date) {
@@ -349,11 +371,19 @@ async function catchUpMissedInvoice(today) {
   // independently-computed anchor date that may have drifted from the Calendar's real cadence.
   if (period.invoiceDate.getTime() === today.getTime()) return;
 
+  const periodKey = `${formatDate(period.serviceStart)}_${formatDate(period.serviceEnd)}`;
+  if (readConfirmedPeriodKey() === periodKey) {
+    // Already confirmed against Stripe on a previous run and nothing has advanced the period
+    // since - no need to ask again today.
+    return;
+  }
+
   // Fetched once here and handed to runAndNotify -> createConsultingInvoice below, instead of
   // each looking the invoice up separately - both need to know whether one already exists (and,
   // if so, whether it still needs its line item) for this exact period.
   const existing = await findExistingInvoice(period.serviceStart, period.serviceEnd);
   if (existing && existing.lines.data.length > 0) {
+    writeConfirmedPeriodKey(periodKey);
     console.log(
       `${formatDate(today)}: not an invoice day, and ${formatDate(period.serviceStart)} to ${formatDate(period.serviceEnd)} is already invoiced. Skipping.`
     );
@@ -364,6 +394,7 @@ async function catchUpMissedInvoice(today) {
     `Missed invoice day for ${formatDate(period.serviceStart)} to ${formatDate(period.serviceEnd)} (due ${formatDate(period.invoiceDate)}). Creating catch-up draft.`
   );
   await runAndNotify(period, "catch-up run", existing);
+  writeConfirmedPeriodKey(periodKey);
 }
 
 async function main() {
