@@ -318,6 +318,13 @@ async function catchUpMissedInvoice(today) {
   if (periodsElapsed < 0) return; // before ANCHOR_INVOICE_DATE, nothing to catch up on yet
 
   const period = periodFromPeriodsElapsed(periodsElapsed);
+
+  // If the current period's invoice date is today, main() already decided (via the Calendar
+  // check or Friday math) whether to invoice today and chose not to. Catch-up exists to fill in
+  // periods that were missed on a *past* run, not to override today's decision with a
+  // independently-computed anchor date that may have drifted from the Calendar's real cadence.
+  if (period.invoiceDate.getTime() === today.getTime()) return;
+
   if (await invoiceAlreadyExists(period.serviceStart, period.serviceEnd)) {
     console.log(
       `${formatDate(today)}: not an invoice day, and ${formatDate(period.serviceStart)} to ${formatDate(period.serviceEnd)} is already invoiced. Skipping.`
