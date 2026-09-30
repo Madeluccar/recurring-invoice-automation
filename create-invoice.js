@@ -4,7 +4,7 @@ import { promisify } from "node:util";
 import { readFileSync, writeFileSync } from "node:fs";
 import { parse as parseDotenv } from "dotenv";
 import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 
 const execFileAsync = promisify(execFile);
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -14,10 +14,25 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 // dependency can't just grep process.env from anywhere to steal them - it would need to
 // specifically target this module. Real environment variables (e.g. set by launchd) still work
 // as a fallback for anything not present in .env.
+//
+// Pass `--env=.env.otherclient` to run against a different client's config file. Each env file
+// gets its own catch-up state file (see CATCH_UP_STATE_FILE), so several clients can be
+// scheduled from this one directory without stepping on each other.
+const ENV_FILE_NAME =
+  process.argv.find((arg) => arg.startsWith("--env="))?.slice("--env=".length) || ".env";
+if (basename(ENV_FILE_NAME) !== ENV_FILE_NAME || !ENV_FILE_NAME.startsWith(".env")) {
+  throw new Error(`--env must name a .env* file in this directory, got: ${ENV_FILE_NAME}`);
+}
+
 const dotenvFile = (() => {
   try {
-    return parseDotenv(readFileSync(join(__dirname, ".env")));
+    return parseDotenv(readFileSync(join(__dirname, ENV_FILE_NAME)));
   } catch {
+    if (ENV_FILE_NAME !== ".env") {
+      // A named client config that can't be read would otherwise silently fall back to the
+      // default client's real environment variables and invoice the wrong customer.
+      throw new Error(`Could not read env file: ${ENV_FILE_NAME}`);
+    }
     return {};
   }
 })();
@@ -75,6 +90,24 @@ const CUSTOMER_ID = requireEnv("STRIPE_CUSTOMER_ID");
 const PRICE_ID = requireEnv("STRIPE_PRICE_ID");
 const TEMPLATE_ID = getEnv("STRIPE_TEMPLATE_ID");
 
+// "every-n-days": an invoice every PERIOD_DAYS from ANCHOR_INVOICE_DATE (e.g. biweekly Fridays).
+// "semimonthly":  an invoice on the 1st and 16th of every month, each covering the half-month
+//                 that just ended. PERIOD_DAYS, SERVICE_DAYS_BEFORE_INVOICE and the Calendar
+//                 event are ignored in this mode; ANCHOR_INVOICE_DATE is the first 1st/16th to
+//                 invoice, so catch-up never reaches back before you started using this.
+const SCHEDULE = getEnv("SCHEDULE") || "every-n-days";
+if (!["every-n-days", "semimonthly"].includes(SCHEDULE)) {
+  throw new Error(`SCHEDULE must be "every-n-days" or "semimonthly", got: ${SCHEDULE}`);
+}
+
+// "days-after":  due DUE_DAYS_AFTER_INVOICE days after the invoice date.
+// "next-friday": due the first Friday strictly after the invoice date (a Friday invoice is due
+//                the following Friday, never the same day).
+const DUE_DATE_RULE = getEnv("DUE_DATE_RULE") || "days-after";
+if (!["days-after", "next-friday"].includes(DUE_DATE_RULE)) {
+  throw new Error(`DUE_DATE_RULE must be "days-after" or "next-friday", got: ${DUE_DATE_RULE}`);
+}
+
 const CLIENT_NAME = requireEnv("CLIENT_NAME");
 const HOURS_PER_PERIOD = parsePositiveNumber(requireEnv("HOURS_PER_PERIOD"), "HOURS_PER_PERIOD");
 const PERIOD_DAYS = parsePositiveInt(getEnv("PERIOD_DAYS") || 14, "PERIOD_DAYS");
@@ -90,8 +123,14 @@ const INVOICE_DESCRIPTION =
   getEnv("INVOICE_DESCRIPTION") || "Consulting services. Review and update memo before sending.";
 const INVOICE_ITEM_DESCRIPTION = getEnv("INVOICE_ITEM_DESCRIPTION") || "Consulting services";
 
-// First invoice date in the recurring series. Every subsequent period is exactly PERIOD_DAYS later.
+// First invoice date in the recurring series. Every subsequent period is exactly PERIOD_DAYS later
+// (every-n-days), or the next 1st/16th (semimonthly).
 const ANCHOR_INVOICE_DATE = parseDate(requireEnv("ANCHOR_INVOICE_DATE"), "ANCHOR_INVOICE_DATE");
+if (SCHEDULE === "semimonthly" && ![1, 16].includes(ANCHOR_INVOICE_DATE.getDate())) {
+  throw new Error(
+    `With SCHEDULE=semimonthly, ANCHOR_INVOICE_DATE must fall on a 1st or 16th, got: ${formatDate(ANCHOR_INVOICE_DATE)}`
+  );
+}
 
 function addDays(date, days) {
   const result = new Date(date);
@@ -127,7 +166,13 @@ function formatDateLegacyUTC(date) {
 // run doesn't have to ask Stripe again on every idle day between invoice dates - only once per
 // period, until that period's own confirmation is cached. Best-effort: if it can't be read or
 // written, catch-up just falls back to asking Stripe every time, same as before this existed.
-const CATCH_UP_STATE_FILE = join(__dirname, ".catch-up-state.json");
+// The default .env keeps the original file name so existing installs keep their cached state.
+const CATCH_UP_STATE_FILE = join(
+  __dirname,
+  ENV_FILE_NAME === ".env"
+    ? ".catch-up-state.json"
+    : `.catch-up-state${ENV_FILE_NAME.slice(".env".length)}.json`
+);
 
 function readConfirmedPeriodKey() {
   try {
@@ -151,11 +196,46 @@ function noonUnix(date) {
   );
 }
 
+function dueDateFor(invoiceDate) {
+  if (DUE_DATE_RULE === "next-friday") {
+    const FRIDAY = 5;
+    return addDays(invoiceDate, (FRIDAY - invoiceDate.getDay() + 7) % 7 || 7);
+  }
+  return addDays(invoiceDate, DUE_DAYS_AFTER_INVOICE);
+}
+
 function periodFromPeriodsElapsed(periodsElapsed) {
+  if (SCHEDULE === "semimonthly") return semimonthlyPeriod(periodsElapsed);
   const invoiceDate = addDays(ANCHOR_INVOICE_DATE, periodsElapsed * PERIOD_DAYS);
   const serviceEnd = invoiceDate;
   const serviceStart = addDays(invoiceDate, -SERVICE_DAYS_BEFORE_INVOICE);
-  const dueDate = addDays(invoiceDate, DUE_DAYS_AFTER_INVOICE);
+  const dueDate = dueDateFor(invoiceDate);
+  return { invoiceDate, serviceStart, serviceEnd, dueDate };
+}
+
+// Semimonthly periods are counted in half-months from ANCHOR_INVOICE_DATE: index 0 is the anchor,
+// index 1 the next 1st/16th, and so on. An invoice on the 1st covers the 16th through the last
+// day of the previous month; an invoice on the 16th covers the 1st through the 15th.
+function semimonthlyIndex(date) {
+  const half = (d) => d.getFullYear() * 24 + d.getMonth() * 2 + (d.getDate() >= 16 ? 1 : 0);
+  return half(date) - half(ANCHOR_INVOICE_DATE);
+}
+
+function semimonthlyPeriod(periodsElapsed) {
+  const anchorHalf = ANCHOR_INVOICE_DATE.getDate() === 16 ? 1 : 0;
+  const totalHalf = anchorHalf + periodsElapsed;
+  const monthOffset = Math.floor(totalHalf / 2);
+  const isSixteenth = totalHalf % 2 === 1;
+  const invoiceDate = new Date(
+    ANCHOR_INVOICE_DATE.getFullYear(),
+    ANCHOR_INVOICE_DATE.getMonth() + monthOffset,
+    isSixteenth ? 16 : 1
+  );
+  const serviceStart = isSixteenth
+    ? new Date(invoiceDate.getFullYear(), invoiceDate.getMonth(), 1)
+    : new Date(invoiceDate.getFullYear(), invoiceDate.getMonth() - 1, 16);
+  const serviceEnd = addDays(invoiceDate, -1);
+  const dueDate = dueDateFor(invoiceDate);
   return { invoiceDate, serviceStart, serviceEnd, dueDate };
 }
 
@@ -165,11 +245,19 @@ function periodFromPeriodsElapsed(periodsElapsed) {
 // "which period are we talking about", instead of a separate rounding-based variant that could
 // snap forward to a not-yet-due period when run off-cycle.
 function periodsElapsedAsOf(today) {
+  if (SCHEDULE === "semimonthly") {
+    // Before the anchor's own 1st/16th, the index can be 0 while today is still earlier (e.g.
+    // anchor Oct 16, today Oct 5), so check the date itself to keep "before anchor" negative.
+    return today < ANCHOR_INVOICE_DATE ? -1 : semimonthlyIndex(today);
+  }
   const offset = daysBetween(ANCHOR_INVOICE_DATE, today);
   return Math.floor(offset / PERIOD_DAYS);
 }
 
 function isInvoiceFriday(today) {
+  if (SCHEDULE === "semimonthly") {
+    return today >= ANCHOR_INVOICE_DATE && [1, 16].includes(today.getDate());
+  }
   const offset = daysBetween(ANCHOR_INVOICE_DATE, today);
   return offset % PERIOD_DAYS === 0;
 }
@@ -209,6 +297,8 @@ async function findCalendarSeries() {
 // Returns true/false if the Calendar check succeeded, or null if it couldn't be performed
 // (e.g. Calendar access not yet granted to osascript, or no matching event exists at all).
 async function hasCalendarEventToday(today) {
+  // Fixed 1st/16th dates don't need a Calendar event to tell us when to invoice.
+  if (SCHEDULE === "semimonthly") return null;
   try {
     const series = await findCalendarSeries();
     if (!series) {
@@ -336,7 +426,8 @@ async function createConsultingInvoice({ invoiceDate, serviceStart, serviceEnd, 
 // `context` goes in the notification title, not just the body, so catch-up's "you missed it"
 // signal stays visible even at a glance, rather than being buried inside the message text.
 async function runAndNotify(period, context, knownExisting) {
-  const title = `Invoice: ${context}`;
+  // Client name up front so it's clear which client an alert is about when several are scheduled.
+  const title = `Invoice (${CLIENT_NAME}): ${context}`;
   try {
     const invoice = await createConsultingInvoice(period, knownExisting);
     if (invoice) {
