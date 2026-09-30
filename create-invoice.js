@@ -1,7 +1,7 @@
 import Stripe from "stripe";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { parse as parseDotenv } from "dotenv";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
@@ -44,8 +44,9 @@ function parseDate(value, name) {
 }
 
 function parseNonNegativeInt(value, name) {
-  const parsed = Number(value);
-  if (!Number.isInteger(parsed) || parsed < 0) {
+  const trimmed = String(value).trim();
+  const parsed = Number(trimmed);
+  if (trimmed === "" || !Number.isInteger(parsed) || parsed < 0) {
     throw new Error(`${name} must be a non-negative whole number, got: ${value}`);
   }
   return parsed;
@@ -82,7 +83,7 @@ const DUE_DAYS_AFTER_INVOICE = parseNonNegativeInt(
   "DUE_DAYS_AFTER_INVOICE"
 );
 const SERVICE_DAYS_BEFORE_INVOICE = parseNonNegativeInt(
-  getEnv("SERVICE_DAYS_BEFORE_INVOICE") || PERIOD_DAYS - 3,
+  getEnv("SERVICE_DAYS_BEFORE_INVOICE") || Math.max(PERIOD_DAYS - 3, 0),
   "SERVICE_DAYS_BEFORE_INVOICE"
 );
 const INVOICE_DESCRIPTION =
@@ -112,6 +113,36 @@ function formatDate(date) {
   const month = String(date.getMonth() + 1).padStart(2, "0");
   const day = String(date.getDate()).padStart(2, "0");
   return `${year}-${month}-${day}`;
+}
+
+// formatDate used to be `date.toISOString().slice(0, 10)` (UTC-based), which drifted from the
+// intended local calendar date near midnight. Invoices created before that fix still carry
+// UTC-formatted dates in their metadata, so matching has to accept either form - otherwise the
+// first run after the fix can't find them and creates a duplicate for an already-invoiced period.
+function formatDateLegacyUTC(date) {
+  return date.toISOString().slice(0, 10);
+}
+
+// Caches the last period catchUpMissedInvoice confirmed was already fully invoiced, so a daily
+// run doesn't have to ask Stripe again on every idle day between invoice dates - only once per
+// period, until that period's own confirmation is cached. Best-effort: if it can't be read or
+// written, catch-up just falls back to asking Stripe every time, same as before this existed.
+const CATCH_UP_STATE_FILE = join(__dirname, ".catch-up-state.json");
+
+function readConfirmedPeriodKey() {
+  try {
+    return JSON.parse(readFileSync(CATCH_UP_STATE_FILE, "utf8")).confirmedPeriodKey ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function writeConfirmedPeriodKey(periodKey) {
+  try {
+    writeFileSync(CATCH_UP_STATE_FILE, JSON.stringify({ confirmedPeriodKey: periodKey }));
+  } catch (error) {
+    console.warn(`Could not persist catch-up state (${error.message.split("\n")[0]}).`);
+  }
 }
 
 function noonUnix(date) {
@@ -205,21 +236,69 @@ async function notify(message, title = "Recurring Invoice Automation") {
   }
 }
 
-async function invoiceAlreadyExists(serviceStart, serviceEnd) {
+function matchesServiceDates(invoice, serviceStart, serviceEnd) {
+  const startMatches =
+    invoice.metadata?.service_start === formatDate(serviceStart) ||
+    invoice.metadata?.service_start === formatDateLegacyUTC(serviceStart);
+  const endMatches =
+    invoice.metadata?.service_end === formatDate(serviceEnd) ||
+    invoice.metadata?.service_end === formatDateLegacyUTC(serviceEnd);
+  return startMatches && endMatches;
+}
+
+async function findExistingInvoice(serviceStart, serviceEnd) {
   const recent = await stripe.invoices.list({ customer: CUSTOMER_ID, limit: 100 });
-  return recent.data.some(
-    (inv) =>
-      inv.metadata?.service_start === formatDate(serviceStart) &&
-      inv.metadata?.service_end === formatDate(serviceEnd)
+  return recent.data.find((inv) => matchesServiceDates(inv, serviceStart, serviceEnd)) ?? null;
+}
+
+// No longer called directly - both call sites now need the invoice object itself (to check for
+// missing line items / share one lookup between catch-up's check and createConsultingInvoice),
+// so they use findExistingInvoice() instead.
+// async function invoiceAlreadyExists(serviceStart, serviceEnd) {
+//   return (await findExistingInvoice(serviceStart, serviceEnd)) !== null;
+// }
+
+async function addInvoiceItem(invoiceId, serviceStart, serviceEnd) {
+  await stripe.invoiceItems.create(
+    {
+      customer: CUSTOMER_ID,
+      invoice: invoiceId,
+      pricing: { price: PRICE_ID },
+      quantity: HOURS_PER_PERIOD,
+      description: INVOICE_ITEM_DESCRIPTION,
+      period: {
+        start: noonUnix(serviceStart),
+        end: noonUnix(serviceEnd),
+      },
+    },
+    { idempotencyKey: `invoiceitem_${invoiceId}` }
   );
 }
 
-async function createConsultingInvoice({ invoiceDate, serviceStart, serviceEnd, dueDate }) {
-  if (await invoiceAlreadyExists(serviceStart, serviceEnd)) {
-    console.log(
-      `Draft already exists for ${formatDate(serviceStart)} - ${formatDate(serviceEnd)}, skipping.`
+// `knownExisting` lets a caller that has already looked up the existing invoice for this period
+// (e.g. catchUpMissedInvoice, which has to check anyway before deciding whether to log a
+// "missed" warning) pass it in, instead of this function repeating the same Stripe list call.
+// Leave it undefined to have this function do its own lookup.
+async function createConsultingInvoice({ invoiceDate, serviceStart, serviceEnd, dueDate }, knownExisting) {
+  const existing = knownExisting !== undefined ? knownExisting : await findExistingInvoice(serviceStart, serviceEnd);
+  if (existing) {
+    // A prior run can have created the invoice but failed before adding its line item (e.g. a
+    // network blip between the two Stripe calls). Rather than treating that empty draft as done
+    // forever, finish it instead of silently skipping.
+    if (existing.lines.data.length > 0) {
+      console.log(
+        `Draft already exists for ${formatDate(serviceStart)} - ${formatDate(serviceEnd)}, skipping.`
+      );
+      return null;
+    }
+    console.warn(
+      `Found invoice ${existing.id} for ${formatDate(serviceStart)} - ${formatDate(serviceEnd)} with no line items, completing it.`
     );
-    return null;
+    await addInvoiceItem(existing.id, serviceStart, serviceEnd);
+    console.log(
+      `Completed invoice: ${existing.id} | ${formatDate(serviceStart)} - ${formatDate(serviceEnd)} | due ${formatDate(dueDate)}`
+    );
+    return existing;
   }
 
   const invoice = await stripe.invoices.create(
@@ -240,20 +319,7 @@ async function createConsultingInvoice({ invoiceDate, serviceStart, serviceEnd, 
     { idempotencyKey: `invoice_${CUSTOMER_ID}_${formatDate(serviceStart)}_${formatDate(serviceEnd)}` }
   );
 
-  await stripe.invoiceItems.create(
-    {
-      customer: CUSTOMER_ID,
-      invoice: invoice.id,
-      pricing: { price: PRICE_ID },
-      quantity: HOURS_PER_PERIOD,
-      description: INVOICE_ITEM_DESCRIPTION,
-      period: {
-        start: noonUnix(serviceStart),
-        end: noonUnix(serviceEnd),
-      },
-    },
-    { idempotencyKey: `invoiceitem_${invoice.id}` }
-  );
+  await addInvoiceItem(invoice.id, serviceStart, serviceEnd);
 
   console.log(
     `Draft invoice created: ${invoice.id} | ${formatDate(serviceStart)} - ${formatDate(serviceEnd)} | due ${formatDate(dueDate)}`
@@ -269,10 +335,10 @@ async function createConsultingInvoice({ invoiceDate, serviceStart, serviceEnd, 
 //                        process exits non-zero, same as before
 // `context` goes in the notification title, not just the body, so catch-up's "you missed it"
 // signal stays visible even at a glance, rather than being buried inside the message text.
-async function runAndNotify(period, context) {
+async function runAndNotify(period, context, knownExisting) {
   const title = `Invoice: ${context}`;
   try {
-    const invoice = await createConsultingInvoice(period);
+    const invoice = await createConsultingInvoice(period, knownExisting);
     if (invoice) {
       await notify(
         `Draft created for ${formatDate(period.serviceStart)} to ${formatDate(period.serviceEnd)}.`,
@@ -281,8 +347,12 @@ async function runAndNotify(period, context) {
     }
     return invoice;
   } catch (error) {
+    // Trimmed to its first line, same as every other place this codebase surfaces error.message:
+    // a raw multi-line Stripe error passed whole into the AppleScript source below isn't escaped
+    // the way AppleScript string literals expect, and can produce a notification that's garbled
+    // or fails outright - the one alert this failure path exists to guarantee.
     await notify(
-      `Could not create invoice for ${formatDate(period.serviceStart)} to ${formatDate(period.serviceEnd)}: ${error.message}`,
+      `Could not create invoice for ${formatDate(period.serviceStart)} to ${formatDate(period.serviceEnd)}: ${error.message.split("\n")[0]}`,
       title
     );
     throw error;
@@ -294,7 +364,26 @@ async function catchUpMissedInvoice(today) {
   if (periodsElapsed < 0) return; // before ANCHOR_INVOICE_DATE, nothing to catch up on yet
 
   const period = periodFromPeriodsElapsed(periodsElapsed);
-  if (await invoiceAlreadyExists(period.serviceStart, period.serviceEnd)) {
+
+  // If the current period's invoice date is today, main() already decided (via the Calendar
+  // check or Friday math) whether to invoice today and chose not to. Catch-up exists to fill in
+  // periods that were missed on a *past* run, not to override today's decision with a
+  // independently-computed anchor date that may have drifted from the Calendar's real cadence.
+  if (period.invoiceDate.getTime() === today.getTime()) return;
+
+  const periodKey = `${formatDate(period.serviceStart)}_${formatDate(period.serviceEnd)}`;
+  if (readConfirmedPeriodKey() === periodKey) {
+    // Already confirmed against Stripe on a previous run and nothing has advanced the period
+    // since - no need to ask again today.
+    return;
+  }
+
+  // Fetched once here and handed to runAndNotify -> createConsultingInvoice below, instead of
+  // each looking the invoice up separately - both need to know whether one already exists (and,
+  // if so, whether it still needs its line item) for this exact period.
+  const existing = await findExistingInvoice(period.serviceStart, period.serviceEnd);
+  if (existing && existing.lines.data.length > 0) {
+    writeConfirmedPeriodKey(periodKey);
     console.log(
       `${formatDate(today)}: not an invoice day, and ${formatDate(period.serviceStart)} to ${formatDate(period.serviceEnd)} is already invoiced. Skipping.`
     );
@@ -304,7 +393,8 @@ async function catchUpMissedInvoice(today) {
   console.warn(
     `Missed invoice day for ${formatDate(period.serviceStart)} to ${formatDate(period.serviceEnd)} (due ${formatDate(period.invoiceDate)}). Creating catch-up draft.`
   );
-  await runAndNotify(period, "catch-up run");
+  await runAndNotify(period, "catch-up run", existing);
+  writeConfirmedPeriodKey(periodKey);
 }
 
 async function main() {
@@ -321,6 +411,15 @@ async function main() {
   const shouldRunToday = calendarMatch === null ? isInvoiceFriday(today) : calendarMatch;
 
   if (shouldRunToday) {
+    // `period` is derived from ANCHOR_INVOICE_DATE/PERIOD_DAYS math, which is only guaranteed to
+    // land on today when the Calendar event's actual recurrence still matches that math. If the
+    // Calendar says yes but today isn't an anchor/period boundary, the two have drifted apart and
+    // the service dates below may be for a stale period rather than today's.
+    if (calendarMatch === true && !isInvoiceFriday(today)) {
+      console.warn(
+        `Calendar says today (${formatDate(today)}) is an invoice day, but it doesn't land on an ANCHOR_INVOICE_DATE/PERIOD_DAYS boundary. The computed service period (${formatDate(period.serviceStart)} - ${formatDate(period.serviceEnd)}) may be stale - check that ANCHOR_INVOICE_DATE and PERIOD_DAYS still match the Calendar event's actual recurrence.`
+      );
+    }
     await runAndNotify(period, "scheduled run");
     return;
   }
