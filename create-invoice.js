@@ -109,7 +109,13 @@ if (!["days-after", "next-friday"].includes(DUE_DATE_RULE)) {
 }
 
 const CLIENT_NAME = requireEnv("CLIENT_NAME");
-const HOURS_PER_PERIOD = parsePositiveNumber(requireEnv("HOURS_PER_PERIOD"), "HOURS_PER_PERIOD");
+// const HOURS_PER_PERIOD = parsePositiveNumber(requireEnv("HOURS_PER_PERIOD"), "HOURS_PER_PERIOD");
+// Leave HOURS_PER_PERIOD blank for a client whose hours vary: the draft then gets a 1-hour
+// placeholder line, labeled so it's obvious the real hours still need entering before sending.
+const HOURS_VARY = !getEnv("HOURS_PER_PERIOD")?.trim();
+const HOURS_PER_PERIOD = HOURS_VARY
+  ? 1
+  : parsePositiveNumber(getEnv("HOURS_PER_PERIOD"), "HOURS_PER_PERIOD");
 const PERIOD_DAYS = parsePositiveInt(getEnv("PERIOD_DAYS") || 14, "PERIOD_DAYS");
 const DUE_DAYS_AFTER_INVOICE = parseNonNegativeInt(
   getEnv("DUE_DAYS_AFTER_INVOICE") || 14,
@@ -355,7 +361,9 @@ async function addInvoiceItem(invoiceId, serviceStart, serviceEnd) {
       invoice: invoiceId,
       pricing: { price: PRICE_ID },
       quantity: HOURS_PER_PERIOD,
-      description: INVOICE_ITEM_DESCRIPTION,
+      description: HOURS_VARY
+        ? `${INVOICE_ITEM_DESCRIPTION} (PLACEHOLDER: update hours before sending)`
+        : INVOICE_ITEM_DESCRIPTION,
       period: {
         start: noonUnix(serviceStart),
         end: noonUnix(serviceEnd),
@@ -432,7 +440,8 @@ async function runAndNotify(period, context, knownExisting) {
     const invoice = await createConsultingInvoice(period, knownExisting);
     if (invoice) {
       await notify(
-        `Draft created for ${formatDate(period.serviceStart)} to ${formatDate(period.serviceEnd)}.`,
+        `Draft created for ${formatDate(period.serviceStart)} to ${formatDate(period.serviceEnd)}.` +
+          (HOURS_VARY ? " Enter the hours before sending." : ""),
         title
       );
     }
