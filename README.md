@@ -85,6 +85,27 @@ the days you expect an invoice.
 `StartCalendarInterval` and `ProgramArguments` pointing `node` at `create-invoice.js` in this
 directory, then load it with `launchctl load`.
 
+## Semimonthly schedule (1st and 16th)
+
+Set `SCHEDULE=semimonthly` to invoice on the 1st and 16th of every month instead of every
+`PERIOD_DAYS`. The invoice on the 1st covers the 16th through the last day of the previous month;
+the invoice on the 16th covers the 1st through the 15th. `ANCHOR_INVOICE_DATE` must be a 1st or
+16th and marks the first invoice, so catch-up never reaches back before it. The Calendar event
+isn't used in this mode.
+
+Pair it with `DUE_DATE_RULE=next-friday` to make each invoice due the first Friday after its
+invoice date (a Friday invoice is due the following Friday).
+
+## Multiple clients
+
+Keep one `.env.<client>` file per client next to `.env` and pass it with `--env`:
+```
+node create-invoice.js --env=.env.otherclient
+```
+Each env file gets its own catch-up state (`.catch-up-state.otherclient.json`), and the client's
+name appears in notification titles. Schedule one daily job per client. All `.env.*` files except
+`.env.example` are gitignored.
+
 ## Notes
 
 - `logs/` and `.env` are gitignored. Don't remove those entries.

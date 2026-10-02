@@ -1,4 +1,6 @@
 node_modules/
 .env
+.env.*
+!.env.example
 logs/
-.catch-up-state.json
+.catch-up-state*.json
