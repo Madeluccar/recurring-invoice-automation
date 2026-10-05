@@ -128,6 +128,9 @@ const SERVICE_DAYS_BEFORE_INVOICE = parseNonNegativeInt(
 const INVOICE_DESCRIPTION =
   getEnv("INVOICE_DESCRIPTION") || "Consulting services. Review and update memo before sending.";
 const INVOICE_ITEM_DESCRIPTION = getEnv("INVOICE_ITEM_DESCRIPTION") || "Consulting services";
+// Optional coupon applied to the line item every period (e.g. a recurring fixed-amount
+// discount). Leave blank for no discount.
+const COUPON_ID = getEnv("STRIPE_COUPON_ID")?.trim() || null;
 
 // First invoice date in the recurring series. Every subsequent period is exactly PERIOD_DAYS later
 // (every-n-days), or the next 1st/16th (semimonthly).
@@ -361,9 +364,14 @@ async function addInvoiceItem(invoiceId, serviceStart, serviceEnd) {
       invoice: invoiceId,
       pricing: { price: PRICE_ID },
       quantity: HOURS_PER_PERIOD,
-      description: HOURS_VARY
-        ? `${INVOICE_ITEM_DESCRIPTION} (PLACEHOLDER: update hours before sending)`
-        : INVOICE_ITEM_DESCRIPTION,
+      // The placeholder note used to live in the description, but a price-based line's
+      // description can't be edited in the Stripe Dashboard, so it ended up on sent invoices.
+      // The reminder now lives in the desktop notification and invoice metadata instead.
+      // description: HOURS_VARY
+      //   ? `${INVOICE_ITEM_DESCRIPTION} (PLACEHOLDER: update hours before sending)`
+      //   : INVOICE_ITEM_DESCRIPTION,
+      description: INVOICE_ITEM_DESCRIPTION,
+      ...(COUPON_ID ? { discounts: [{ coupon: COUPON_ID }] } : {}),
       period: {
         start: noonUnix(serviceStart),
         end: noonUnix(serviceEnd),
@@ -412,6 +420,7 @@ async function createConsultingInvoice({ invoiceDate, serviceStart, serviceEnd, 
         service_start: formatDate(serviceStart),
         service_end: formatDate(serviceEnd),
         intended_invoice_date: formatDate(invoiceDate),
+        ...(HOURS_VARY ? { hours_placeholder: "update quantity before sending" } : {}),
       },
     },
     { idempotencyKey: `invoice_${CUSTOMER_ID}_${formatDate(serviceStart)}_${formatDate(serviceEnd)}` }
@@ -441,7 +450,7 @@ async function runAndNotify(period, context, knownExisting) {
     if (invoice) {
       await notify(
         `Draft created for ${formatDate(period.serviceStart)} to ${formatDate(period.serviceEnd)}.` +
-          (HOURS_VARY ? " Enter the hours before sending." : ""),
+          (HOURS_VARY ? " It has a 1-hour placeholder: set the real hours before sending." : ""),
         title
       );
     }
