@@ -9,6 +9,20 @@ import { basename, dirname, join } from "node:path";
 const execFileAsync = promisify(execFile);
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
+// Prefix every log line with the local date and time, so the launchd log files show when each
+// run (and each Stripe failure) happened instead of an undated stream of messages.
+for (const method of ["log", "warn", "error"]) {
+  const write = console[method].bind(console);
+  console[method] = (...args) => write(`[${timestamp()}]`, ...args);
+}
+
+function timestamp(now = new Date()) {
+  const time = [now.getHours(), now.getMinutes(), now.getSeconds()]
+    .map((part) => String(part).padStart(2, "0"))
+    .join(":");
+  return `${formatDate(now)} ${time}`;
+}
+
 // Read .env into a local object instead of `dotenv/config`, which copies every key into the
 // global process.env for the whole Node process. Keeping secrets local means a compromised
 // dependency can't just grep process.env from anywhere to steal them - it would need to
@@ -85,7 +99,19 @@ function parsePositiveNumber(value, name) {
 
 const CALENDAR_EVENT_NAME = getEnv("CALENDAR_EVENT_NAME") || "Create Invoice";
 
-const stripe = new Stripe(requireEnv("STRIPE_SECRET_KEY"));
+// const stripe = new Stripe(requireEnv("STRIPE_SECRET_KEY"));
+// launchd fires at a fixed time, often right after the Mac wakes and before Wi-Fi is back, and the
+// SDK's default of 2 retries gave up within a few seconds ("An error occurred with our connection
+// to Stripe"). Six retries with the SDK's exponential backoff ride out a slow reconnect.
+const stripe = new Stripe(requireEnv("STRIPE_SECRET_KEY"), {
+  maxNetworkRetries: 6,
+  timeout: 30_000,
+});
+
+// How many periods back catch-up looks for missed invoices. It stops sooner at the first period
+// that's already invoiced (or cached as confirmed); this only bounds the Stripe lookups on a first
+// run or after a very long time off.
+const MAX_CATCH_UP_PERIODS = 6;
 const CUSTOMER_ID = requireEnv("STRIPE_CUSTOMER_ID");
 const PRICE_ID = requireEnv("STRIPE_PRICE_ID");
 const TEMPLATE_ID = getEnv("STRIPE_TEMPLATE_ID");
@@ -358,9 +384,31 @@ function matchesServiceDates(invoice, serviceStart, serviceEnd) {
   return startMatches && endMatches;
 }
 
-async function findExistingInvoice(serviceStart, serviceEnd) {
-  const recent = await stripe.invoices.list({ customer: CUSTOMER_ID, limit: 100 });
-  return recent.data.find((inv) => matchesServiceDates(inv, serviceStart, serviceEnd)) ?? null;
+// Replaced by findPeriodInvoice: this counted voided invoices as "already invoiced" (so voiding a
+// wrong invoice meant the period was never re-created) and only looked at the newest 100.
+// async function findExistingInvoice(serviceStart, serviceEnd) {
+//   const recent = await stripe.invoices.list({ customer: CUSTOMER_ID, limit: 100 });
+//   return recent.data.find((inv) => matchesServiceDates(inv, serviceStart, serviceEnd)) ?? null;
+// }
+
+// Looks up this period's invoice across all of the customer's invoices (auto-paginated, newest
+// first). Voided invoices are skipped, so voiding a wrong invoice lets the period be invoiced
+// again; `voidedCount` keeps the re-created invoice's idempotency key distinct from the voided one.
+async function findPeriodInvoice(serviceStart, serviceEnd) {
+  let voidedCount = 0;
+  for await (const invoice of stripe.invoices.list({ customer: CUSTOMER_ID, limit: 100 })) {
+    if (!matchesServiceDates(invoice, serviceStart, serviceEnd)) continue;
+    if (invoice.status === "void") {
+      voidedCount += 1;
+      continue;
+    }
+    return { invoice, voidedCount };
+  }
+  return { invoice: null, voidedCount };
+}
+
+function periodKeyFor(period) {
+  return `${formatDate(period.serviceStart)}_${formatDate(period.serviceEnd)}`;
 }
 
 // No longer called directly - both call sites now need the invoice object itself (to check for
@@ -394,12 +442,13 @@ async function addInvoiceItem(invoiceId, serviceStart, serviceEnd) {
   );
 }
 
-// `knownExisting` lets a caller that has already looked up the existing invoice for this period
-// (e.g. catchUpMissedInvoice, which has to check anyway before deciding whether to log a
-// "missed" warning) pass it in, instead of this function repeating the same Stripe list call.
+// `knownLookup` lets a caller that has already run findPeriodInvoice for this period (e.g.
+// catchUpMissedInvoices, which has to check anyway before deciding whether to log a "missed"
+// warning) pass the result in, instead of this function repeating the same Stripe list call.
 // Leave it undefined to have this function do its own lookup.
-async function createConsultingInvoice({ invoiceDate, serviceStart, serviceEnd, dueDate }, knownExisting) {
-  const existing = knownExisting !== undefined ? knownExisting : await findExistingInvoice(serviceStart, serviceEnd);
+async function createConsultingInvoice({ invoiceDate, serviceStart, serviceEnd, dueDate }, knownLookup) {
+  const lookup = knownLookup !== undefined ? knownLookup : await findPeriodInvoice(serviceStart, serviceEnd);
+  const existing = lookup.invoice;
   if (existing) {
     // A prior run can have created the invoice but failed before adding its line item (e.g. a
     // network blip between the two Stripe calls). Rather than treating that empty draft as done
@@ -436,7 +485,14 @@ async function createConsultingInvoice({ invoiceDate, serviceStart, serviceEnd, 
         ...(HOURS_VARY ? { hours_placeholder: "update quantity before sending" } : {}),
       },
     },
-    { idempotencyKey: `invoice_${CUSTOMER_ID}_${formatDate(serviceStart)}_${formatDate(serviceEnd)}` }
+    // { idempotencyKey: `invoice_${CUSTOMER_ID}_${formatDate(serviceStart)}_${formatDate(serviceEnd)}` }
+    // Suffixed after a void: within Stripe's 24h idempotency window, reusing the original key
+    // would just return the voided invoice instead of creating a new one.
+    {
+      idempotencyKey:
+        `invoice_${CUSTOMER_ID}_${formatDate(serviceStart)}_${formatDate(serviceEnd)}` +
+        (lookup.voidedCount ? `_v${lookup.voidedCount}` : ""),
+    }
   );
 
   const item = await addInvoiceItem(invoice.id, serviceStart, serviceEnd);
@@ -455,11 +511,11 @@ async function createConsultingInvoice({ invoiceDate, serviceStart, serviceEnd, 
 //                        process exits non-zero, same as before
 // `context` goes in the notification title, not just the body, so catch-up's "you missed it"
 // signal stays visible even at a glance, rather than being buried inside the message text.
-async function runAndNotify(period, context, knownExisting) {
+async function runAndNotify(period, context, knownLookup) {
   // Client name up front so it's clear which client an alert is about when several are scheduled.
   const title = `Invoice (${CLIENT_NAME}): ${context}`;
   try {
-    const invoice = await createConsultingInvoice(period, knownExisting);
+    const invoice = await createConsultingInvoice(period, knownLookup);
     if (invoice) {
       await notify(
         `Draft created for ${formatDate(period.serviceStart)} to ${formatDate(period.serviceEnd)}: ${invoice.amountSummary}.` +
@@ -481,42 +537,111 @@ async function runAndNotify(period, context, knownExisting) {
   }
 }
 
-async function catchUpMissedInvoice(today) {
-  const periodsElapsed = periodsElapsedAsOf(today);
-  if (periodsElapsed < 0) return; // before ANCHOR_INVOICE_DATE, nothing to catch up on yet
+// Replaced by catchUpMissedInvoices: this only checked the single most recent period, so if two
+// or more invoice dates passed while the Mac was off (or Stripe failed on consecutive runs), the
+// older periods were never invoiced and nothing warned about it.
+// async function catchUpMissedInvoice(today) {
+//   const periodsElapsed = periodsElapsedAsOf(today);
+//   if (periodsElapsed < 0) return; // before ANCHOR_INVOICE_DATE, nothing to catch up on yet
+//
+//   const period = periodFromPeriodsElapsed(periodsElapsed);
+//
+//   // If the current period's invoice date is today, main() already decided (via the Calendar
+//   // check or Friday math) whether to invoice today and chose not to. Catch-up exists to fill in
+//   // periods that were missed on a *past* run, not to override today's decision with a
+//   // independently-computed anchor date that may have drifted from the Calendar's real cadence.
+//   if (period.invoiceDate.getTime() === today.getTime()) return;
+//
+//   const periodKey = `${formatDate(period.serviceStart)}_${formatDate(period.serviceEnd)}`;
+//   if (readConfirmedPeriodKey() === periodKey) {
+//     // Already confirmed against Stripe on a previous run and nothing has advanced the period
+//     // since - no need to ask again today.
+//     return;
+//   }
+//
+//   // Fetched once here and handed to runAndNotify -> createConsultingInvoice below, instead of
+//   // each looking the invoice up separately - both need to know whether one already exists (and,
+//   // if so, whether it still needs its line item) for this exact period.
+//   const existing = await findExistingInvoice(period.serviceStart, period.serviceEnd);
+//   if (existing && existing.lines.data.length > 0) {
+//     writeConfirmedPeriodKey(periodKey);
+//     console.log(
+//       `${formatDate(today)}: not an invoice day, and ${formatDate(period.serviceStart)} to ${formatDate(period.serviceEnd)} is already invoiced. Skipping.`
+//     );
+//     return;
+//   }
+//
+//   console.warn(
+//     `Missed invoice day for ${formatDate(period.serviceStart)} to ${formatDate(period.serviceEnd)} (due ${formatDate(period.invoiceDate)}). Creating catch-up draft.`
+//   );
+//   await runAndNotify(period, "catch-up run", existing);
+//   writeConfirmedPeriodKey(periodKey);
+// }
 
-  const period = periodFromPeriodsElapsed(periodsElapsed);
+// Walks back from the most recent past period to the first one that's already invoiced (or
+// cached as confirmed), then creates drafts for every missed period in between, oldest first.
+async function catchUpMissedInvoices(today) {
+  let latest = periodsElapsedAsOf(today);
+  if (latest < 0) return; // before ANCHOR_INVOICE_DATE, nothing to catch up on yet
 
   // If the current period's invoice date is today, main() already decided (via the Calendar
   // check or Friday math) whether to invoice today and chose not to. Catch-up exists to fill in
   // periods that were missed on a *past* run, not to override today's decision with a
   // independently-computed anchor date that may have drifted from the Calendar's real cadence.
-  if (period.invoiceDate.getTime() === today.getTime()) return;
+  // Older periods are still checked.
+  if (periodFromPeriodsElapsed(latest).invoiceDate.getTime() === today.getTime()) latest -= 1;
+  if (latest < 0) return;
 
-  const periodKey = `${formatDate(period.serviceStart)}_${formatDate(period.serviceEnd)}`;
-  if (readConfirmedPeriodKey() === periodKey) {
-    // Already confirmed against Stripe on a previous run and nothing has advanced the period
-    // since - no need to ask again today.
-    return;
+  const latestPeriod = periodFromPeriodsElapsed(latest);
+  const latestKey = periodKeyFor(latestPeriod);
+  const confirmedKey = readConfirmedPeriodKey();
+  // Already confirmed against Stripe on a previous run and nothing has advanced the period
+  // since - no need to ask again today.
+  if (confirmedKey === latestKey) return;
+
+  // Each lookup is handed to runAndNotify -> createConsultingInvoice below, instead of looking
+  // the invoice up again - both need to know whether one already exists (and, if so, whether it
+  // still needs its line item) for this exact period.
+  const missed = [];
+  let reachedInvoicedPeriod = false;
+  for (let index = latest; index >= 0 && index > latest - MAX_CATCH_UP_PERIODS; index -= 1) {
+    const period = periodFromPeriodsElapsed(index);
+    if (periodKeyFor(period) === confirmedKey) {
+      reachedInvoicedPeriod = true;
+      break;
+    }
+    const lookup = await findPeriodInvoice(period.serviceStart, period.serviceEnd);
+    if (lookup.invoice && lookup.invoice.lines.data.length > 0) {
+      reachedInvoicedPeriod = true;
+      break;
+    }
+    missed.unshift({ period, lookup });
   }
 
-  // Fetched once here and handed to runAndNotify -> createConsultingInvoice below, instead of
-  // each looking the invoice up separately - both need to know whether one already exists (and,
-  // if so, whether it still needs its line item) for this exact period.
-  const existing = await findExistingInvoice(period.serviceStart, period.serviceEnd);
-  if (existing && existing.lines.data.length > 0) {
-    writeConfirmedPeriodKey(periodKey);
+  if (missed.length === 0) {
+    writeConfirmedPeriodKey(latestKey);
     console.log(
-      `${formatDate(today)}: not an invoice day, and ${formatDate(period.serviceStart)} to ${formatDate(period.serviceEnd)} is already invoiced. Skipping.`
+      `${formatDate(today)}: not an invoice day, and ${formatDate(latestPeriod.serviceStart)} to ${formatDate(latestPeriod.serviceEnd)} is already invoiced. Skipping.`
     );
     return;
   }
 
-  console.warn(
-    `Missed invoice day for ${formatDate(period.serviceStart)} to ${formatDate(period.serviceEnd)} (due ${formatDate(period.invoiceDate)}). Creating catch-up draft.`
-  );
-  await runAndNotify(period, "catch-up run", existing);
-  writeConfirmedPeriodKey(periodKey);
+  const oldestIndex = latest - missed.length + 1;
+  if (!reachedInvoicedPeriod && oldestIndex > 0) {
+    console.warn(
+      `Catch-up only looks back ${MAX_CATCH_UP_PERIODS} periods; anything before ${formatDate(missed[0].period.serviceStart)} was not checked. Use --force on those dates' periods if needed.`
+    );
+  }
+
+  for (const { period, lookup } of missed) {
+    console.warn(
+      `Missed invoice day for ${formatDate(period.serviceStart)} to ${formatDate(period.serviceEnd)} (due ${formatDate(period.invoiceDate)}). Creating catch-up draft.`
+    );
+    // Throws on failure, which skips writing the confirmed key below, so the next run retries.
+    // Drafts already created this run are found by that run's walk-back and stop it there.
+    await runAndNotify(period, "catch-up run", lookup);
+  }
+  writeConfirmedPeriodKey(latestKey);
 }
 
 async function main() {
@@ -546,7 +671,8 @@ async function main() {
     return;
   }
 
-  await catchUpMissedInvoice(today);
+  // await catchUpMissedInvoice(today);
+  await catchUpMissedInvoices(today);
 }
 
 main().catch((error) => {
