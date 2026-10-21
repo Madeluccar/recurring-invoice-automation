@@ -163,6 +163,19 @@ function formatDate(date) {
   return `${year}-${month}-${day}`;
 }
 
+// Stripe amounts are in cents; unit_amount_decimal is a string of (possibly fractional) cents.
+function formatUsd(cents) {
+  return `$${(Number(cents) / 100).toFixed(2)}`;
+}
+
+// "10 h × $100.00 = $1000.00" for the log and notification, so a stale STRIPE_PRICE_ID (wrong
+// hourly rate) shows up on the day the draft is created instead of when it's about to be sent.
+function describeAmount(item) {
+  const unit = item.pricing?.unit_amount_decimal;
+  const rate = unit != null ? ` × ${formatUsd(unit)}` : "";
+  return `${item.quantity} h${rate} = ${formatUsd(item.amount)}`;
+}
+
 // formatDate used to be `date.toISOString().slice(0, 10)` (UTC-based), which drifted from the
 // intended local calendar date near midnight. Invoices created before that fix still carry
 // UTC-formatted dates in their metadata, so matching has to accept either form - otherwise the
@@ -358,7 +371,7 @@ async function findExistingInvoice(serviceStart, serviceEnd) {
 // }
 
 async function addInvoiceItem(invoiceId, serviceStart, serviceEnd) {
-  await stripe.invoiceItems.create(
+  return stripe.invoiceItems.create(
     {
       customer: CUSTOMER_ID,
       invoice: invoiceId,
@@ -400,11 +413,11 @@ async function createConsultingInvoice({ invoiceDate, serviceStart, serviceEnd, 
     console.warn(
       `Found invoice ${existing.id} for ${formatDate(serviceStart)} - ${formatDate(serviceEnd)} with no line items, completing it.`
     );
-    await addInvoiceItem(existing.id, serviceStart, serviceEnd);
+    const item = await addInvoiceItem(existing.id, serviceStart, serviceEnd);
     console.log(
-      `Completed invoice: ${existing.id} | ${formatDate(serviceStart)} - ${formatDate(serviceEnd)} | due ${formatDate(dueDate)}`
+      `Completed invoice: ${existing.id} | ${formatDate(serviceStart)} - ${formatDate(serviceEnd)} | due ${formatDate(dueDate)} | ${describeAmount(item)}`
     );
-    return existing;
+    return { ...existing, amountSummary: describeAmount(item) };
   }
 
   const invoice = await stripe.invoices.create(
@@ -426,12 +439,12 @@ async function createConsultingInvoice({ invoiceDate, serviceStart, serviceEnd, 
     { idempotencyKey: `invoice_${CUSTOMER_ID}_${formatDate(serviceStart)}_${formatDate(serviceEnd)}` }
   );
 
-  await addInvoiceItem(invoice.id, serviceStart, serviceEnd);
+  const item = await addInvoiceItem(invoice.id, serviceStart, serviceEnd);
 
   console.log(
-    `Draft invoice created: ${invoice.id} | ${formatDate(serviceStart)} - ${formatDate(serviceEnd)} | due ${formatDate(dueDate)}`
+    `Draft invoice created: ${invoice.id} | ${formatDate(serviceStart)} - ${formatDate(serviceEnd)} | due ${formatDate(dueDate)} | ${describeAmount(item)}`
   );
-  return invoice;
+  return { ...invoice, amountSummary: describeAmount(item) };
 }
 
 // Creates the invoice for `period` under a given `context` ("scheduled run", "forced run", or
@@ -449,7 +462,7 @@ async function runAndNotify(period, context, knownExisting) {
     const invoice = await createConsultingInvoice(period, knownExisting);
     if (invoice) {
       await notify(
-        `Draft created for ${formatDate(period.serviceStart)} to ${formatDate(period.serviceEnd)}.` +
+        `Draft created for ${formatDate(period.serviceStart)} to ${formatDate(period.serviceEnd)}: ${invoice.amountSummary}.` +
           (HOURS_VARY ? " It has a 1-hour placeholder: set the real hours before sending." : ""),
         title
       );
