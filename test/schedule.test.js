@@ -94,6 +94,12 @@ describe("every-n-days schedule (biweekly Fridays)", () => {
     assert.equal(schedule.isInvoiceFriday(d("2026-01-17")), false);
   });
 
+  test("isInvoiceFriday is false before the anchor, even a whole number of periods back", () => {
+    assert.equal(schedule.isInvoiceFriday(d("2025-12-19")), false); // 14 days before the anchor
+    assert.equal(schedule.isInvoiceFriday(d("2025-12-05")), false); // 28 days before
+    assert.equal(schedule.isInvoiceFriday(d("2026-01-01")), false);
+  });
+
   test("every invoice date maps back to its own period for two years", () => {
     for (let index = 0; index < 52; index += 1) {
       const { invoiceDate } = schedule.periodFromPeriodsElapsed(index);
