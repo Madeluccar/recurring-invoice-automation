@@ -102,7 +102,11 @@ export function createSchedule({
       return today >= anchorInvoiceDate && [1, 16].includes(today.getDate());
     }
     const offset = daysBetween(anchorInvoiceDate, today);
-    return offset % periodDays === 0;
+    // return offset % periodDays === 0;
+    // Without the `offset >= 0` check, a date a whole number of periods *before* the anchor also
+    // counted as an invoice day (-14 % 14 is -0, which === 0), so a run before the first invoice
+    // date could create a draft for a period that predates the series.
+    return offset >= 0 && offset % periodDays === 0;
   }
 
   return { dueDateFor, periodFromPeriodsElapsed, periodsElapsedAsOf, isInvoiceFriday };
