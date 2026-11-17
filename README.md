@@ -70,6 +70,15 @@ notification if a run finds nothing to do.
    npm run invoice:force
    ```
 
+## Tests
+
+The schedule date math (period boundaries, service dates, due dates) lives in `schedule.js` and
+has unit tests that need no Stripe key or `.env` file:
+
+```
+npm test
+```
+
 ## Scheduling
 
 Run it daily. The script itself decides whether today's an invoice day, and the catch-up behavior

@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "invoice": "node create-invoice.js",
-    "invoice:force": "node create-invoice.js --force"
+    "invoice:force": "node create-invoice.js --force",
+    "test": "node --test"
   },
   "dependencies": {
     "dotenv": "16.6.1",
