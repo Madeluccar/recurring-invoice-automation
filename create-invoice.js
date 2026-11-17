@@ -5,6 +5,7 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { parse as parseDotenv } from "dotenv";
 import { fileURLToPath } from "node:url";
 import { basename, dirname, join } from "node:path";
+import { createSchedule, daysBetween, formatDate, startOfDay } from "./schedule.js";
 
 const execFileAsync = promisify(execFile);
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -167,27 +168,28 @@ if (SCHEDULE === "semimonthly" && ![1, 16].includes(ANCHOR_INVOICE_DATE.getDate(
   );
 }
 
-function addDays(date, days) {
-  const result = new Date(date);
-  result.setDate(result.getDate() + days);
-  return result;
-}
-
-function daysBetween(a, b) {
-  const msPerDay = 24 * 60 * 60 * 1000;
-  return Math.round((startOfDay(b) - startOfDay(a)) / msPerDay);
-}
-
-function startOfDay(date) {
-  return new Date(date.getFullYear(), date.getMonth(), date.getDate());
-}
-
-function formatDate(date) {
-  const year = date.getFullYear();
-  const month = String(date.getMonth() + 1).padStart(2, "0");
-  const day = String(date.getDate()).padStart(2, "0");
-  return `${year}-${month}-${day}`;
-}
+// addDays, daysBetween, startOfDay and formatDate moved to schedule.js (imported above).
+// function addDays(date, days) {
+//   const result = new Date(date);
+//   result.setDate(result.getDate() + days);
+//   return result;
+// }
+//
+// function daysBetween(a, b) {
+//   const msPerDay = 24 * 60 * 60 * 1000;
+//   return Math.round((startOfDay(b) - startOfDay(a)) / msPerDay);
+// }
+//
+// function startOfDay(date) {
+//   return new Date(date.getFullYear(), date.getMonth(), date.getDate());
+// }
+//
+// function formatDate(date) {
+//   const year = date.getFullYear();
+//   const month = String(date.getMonth() + 1).padStart(2, "0");
+//   const day = String(date.getDate()).padStart(2, "0");
+//   return `${year}-${month}-${day}`;
+// }
 
 // Stripe amounts are in cents; unit_amount_decimal is a string of (possibly fractional) cents.
 function formatUsd(cents) {
@@ -244,71 +246,82 @@ function noonUnix(date) {
   );
 }
 
-function dueDateFor(invoiceDate) {
-  if (DUE_DATE_RULE === "next-friday") {
-    const FRIDAY = 5;
-    return addDays(invoiceDate, (FRIDAY - invoiceDate.getDay() + 7) % 7 || 7);
-  }
-  return addDays(invoiceDate, DUE_DAYS_AFTER_INVOICE);
-}
+// The schedule date math (dueDateFor through isInvoiceFriday) moved to schedule.js, built once
+// from this file's config so the logic can be unit-tested without Stripe or a .env file.
+const { periodFromPeriodsElapsed, periodsElapsedAsOf, isInvoiceFriday } = createSchedule({
+  schedule: SCHEDULE,
+  anchorInvoiceDate: ANCHOR_INVOICE_DATE,
+  periodDays: PERIOD_DAYS,
+  serviceDaysBeforeInvoice: SERVICE_DAYS_BEFORE_INVOICE,
+  dueDateRule: DUE_DATE_RULE,
+  dueDaysAfterInvoice: DUE_DAYS_AFTER_INVOICE,
+});
 
-function periodFromPeriodsElapsed(periodsElapsed) {
-  if (SCHEDULE === "semimonthly") return semimonthlyPeriod(periodsElapsed);
-  const invoiceDate = addDays(ANCHOR_INVOICE_DATE, periodsElapsed * PERIOD_DAYS);
-  const serviceEnd = invoiceDate;
-  const serviceStart = addDays(invoiceDate, -SERVICE_DAYS_BEFORE_INVOICE);
-  const dueDate = dueDateFor(invoiceDate);
-  return { invoiceDate, serviceStart, serviceEnd, dueDate };
-}
-
-// Semimonthly periods are counted in half-months from ANCHOR_INVOICE_DATE: index 0 is the anchor,
-// index 1 the next 1st/16th, and so on. An invoice on the 1st covers the 16th through the last
-// day of the previous month; an invoice on the 16th covers the 1st through the 15th.
-function semimonthlyIndex(date) {
-  const half = (d) => d.getFullYear() * 24 + d.getMonth() * 2 + (d.getDate() >= 16 ? 1 : 0);
-  return half(date) - half(ANCHOR_INVOICE_DATE);
-}
-
-function semimonthlyPeriod(periodsElapsed) {
-  const anchorHalf = ANCHOR_INVOICE_DATE.getDate() === 16 ? 1 : 0;
-  const totalHalf = anchorHalf + periodsElapsed;
-  const monthOffset = Math.floor(totalHalf / 2);
-  const isSixteenth = totalHalf % 2 === 1;
-  const invoiceDate = new Date(
-    ANCHOR_INVOICE_DATE.getFullYear(),
-    ANCHOR_INVOICE_DATE.getMonth() + monthOffset,
-    isSixteenth ? 16 : 1
-  );
-  const serviceStart = isSixteenth
-    ? new Date(invoiceDate.getFullYear(), invoiceDate.getMonth(), 1)
-    : new Date(invoiceDate.getFullYear(), invoiceDate.getMonth() - 1, 16);
-  const serviceEnd = addDays(invoiceDate, -1);
-  const dueDate = dueDateFor(invoiceDate);
-  return { invoiceDate, serviceStart, serviceEnd, dueDate };
-}
-
-// Number of full periods that have elapsed as of `today`, always rounding down so the result
-// never points at a period that hasn't happened yet. Negative before ANCHOR_INVOICE_DATE. Used
-// for every period lookup (on-time, --force, catch-up) so there's a single source of truth for
-// "which period are we talking about", instead of a separate rounding-based variant that could
-// snap forward to a not-yet-due period when run off-cycle.
-function periodsElapsedAsOf(today) {
-  if (SCHEDULE === "semimonthly") {
-    // Before the anchor's own 1st/16th, the index can be 0 while today is still earlier (e.g.
-    // anchor Oct 16, today Oct 5), so check the date itself to keep "before anchor" negative.
-    return today < ANCHOR_INVOICE_DATE ? -1 : semimonthlyIndex(today);
-  }
-  const offset = daysBetween(ANCHOR_INVOICE_DATE, today);
-  return Math.floor(offset / PERIOD_DAYS);
-}
-
-function isInvoiceFriday(today) {
-  if (SCHEDULE === "semimonthly") {
-    return today >= ANCHOR_INVOICE_DATE && [1, 16].includes(today.getDate());
-  }
-  const offset = daysBetween(ANCHOR_INVOICE_DATE, today);
-  return offset % PERIOD_DAYS === 0;
-}
+// function dueDateFor(invoiceDate) {
+//   if (DUE_DATE_RULE === "next-friday") {
+//     const FRIDAY = 5;
+//     return addDays(invoiceDate, (FRIDAY - invoiceDate.getDay() + 7) % 7 || 7);
+//   }
+//   return addDays(invoiceDate, DUE_DAYS_AFTER_INVOICE);
+// }
+//
+// function periodFromPeriodsElapsed(periodsElapsed) {
+//   if (SCHEDULE === "semimonthly") return semimonthlyPeriod(periodsElapsed);
+//   const invoiceDate = addDays(ANCHOR_INVOICE_DATE, periodsElapsed * PERIOD_DAYS);
+//   const serviceEnd = invoiceDate;
+//   const serviceStart = addDays(invoiceDate, -SERVICE_DAYS_BEFORE_INVOICE);
+//   const dueDate = dueDateFor(invoiceDate);
+//   return { invoiceDate, serviceStart, serviceEnd, dueDate };
+// }
+//
+// // Semimonthly periods are counted in half-months from ANCHOR_INVOICE_DATE: index 0 is the anchor,
+// // index 1 the next 1st/16th, and so on. An invoice on the 1st covers the 16th through the last
+// // day of the previous month; an invoice on the 16th covers the 1st through the 15th.
+// function semimonthlyIndex(date) {
+//   const half = (d) => d.getFullYear() * 24 + d.getMonth() * 2 + (d.getDate() >= 16 ? 1 : 0);
+//   return half(date) - half(ANCHOR_INVOICE_DATE);
+// }
+//
+// function semimonthlyPeriod(periodsElapsed) {
+//   const anchorHalf = ANCHOR_INVOICE_DATE.getDate() === 16 ? 1 : 0;
+//   const totalHalf = anchorHalf + periodsElapsed;
+//   const monthOffset = Math.floor(totalHalf / 2);
+//   const isSixteenth = totalHalf % 2 === 1;
+//   const invoiceDate = new Date(
+//     ANCHOR_INVOICE_DATE.getFullYear(),
+//     ANCHOR_INVOICE_DATE.getMonth() + monthOffset,
+//     isSixteenth ? 16 : 1
+//   );
+//   const serviceStart = isSixteenth
+//     ? new Date(invoiceDate.getFullYear(), invoiceDate.getMonth(), 1)
+//     : new Date(invoiceDate.getFullYear(), invoiceDate.getMonth() - 1, 16);
+//   const serviceEnd = addDays(invoiceDate, -1);
+//   const dueDate = dueDateFor(invoiceDate);
+//   return { invoiceDate, serviceStart, serviceEnd, dueDate };
+// }
+//
+// // Number of full periods that have elapsed as of `today`, always rounding down so the result
+// // never points at a period that hasn't happened yet. Negative before ANCHOR_INVOICE_DATE. Used
+// // for every period lookup (on-time, --force, catch-up) so there's a single source of truth for
+// // "which period are we talking about", instead of a separate rounding-based variant that could
+// // snap forward to a not-yet-due period when run off-cycle.
+// function periodsElapsedAsOf(today) {
+//   if (SCHEDULE === "semimonthly") {
+//     // Before the anchor's own 1st/16th, the index can be 0 while today is still earlier (e.g.
+//     // anchor Oct 16, today Oct 5), so check the date itself to keep "before anchor" negative.
+//     return today < ANCHOR_INVOICE_DATE ? -1 : semimonthlyIndex(today);
+//   }
+//   const offset = daysBetween(ANCHOR_INVOICE_DATE, today);
+//   return Math.floor(offset / PERIOD_DAYS);
+// }
+//
+// function isInvoiceFriday(today) {
+//   if (SCHEDULE === "semimonthly") {
+//     return today >= ANCHOR_INVOICE_DATE && [1, 16].includes(today.getDate());
+//   }
+//   const offset = daysBetween(ANCHOR_INVOICE_DATE, today);
+//   return offset % PERIOD_DAYS === 0;
+// }
 
 // AppleScript's "whose start date" filter only matches an event's first occurrence, not
 // future instances of a recurring event, so instead we read the event's own start date +
